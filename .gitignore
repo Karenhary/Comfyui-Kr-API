@@ -44,3 +44,7 @@ desktop.ini
 *.log
 *.tmp
 .cache/
+
+# 服务端代码（不属于 ComfyUI 插件，临时放工作区里方便分析）
+server.js
+.env

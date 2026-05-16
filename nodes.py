@@ -1638,57 +1638,58 @@ def _submit_gemini_task_to_gateway(task_payload: Dict[str, Any]) -> Tuple[str, s
         - 成功拿到 task_id：(task_id, query_url, None, "")
         - 直接返图：("", "", tensor, "")
         - 失败：("", "", None, "...错误信息...")
+
+    走 OpenAI chat/completions 协议，与同步节点和下游其他客户端一致。
+    比例 / 分辨率字段同时塞多个常见位置，让上游用哪种 schema 都能命中。
     """
     model_name = str(task_payload.get("model_name", "") or "").strip()
     api_key = str(task_payload.get("api_key", "") or "").strip()
     prompt = str(task_payload.get("prompt", "") or "").strip() or "请根据参考图生成图像"
     ratio_for_api = str(task_payload.get("ratio_for_api", "1:1") or "1:1").strip()
+    size_for_api = str(task_payload.get("size_for_api", "") or "").strip()
     seed_for_api = int(task_payload.get("seed_for_api", -1))
 
     if not model_name or not api_key:
         return "", "", None, "missing model or api_key"
 
     request_data = task_payload.get("request_data") or {}
-    refs_data_urls: List[str] = []
-    if isinstance(request_data, dict):
-        contents = request_data.get("contents")
-        if isinstance(contents, list) and contents and isinstance(contents[0], dict):
-            parts = contents[0].get("parts")
-            if isinstance(parts, list):
-                for part in parts:
-                    if not isinstance(part, dict):
-                        continue
-                    inline = part.get("inlineData")
-                    if isinstance(inline, dict):
-                        b64 = inline.get("data")
-                        mime = str(inline.get("mimeType", "image/png") or "image/png")
-                        if isinstance(b64, str) and b64.strip():
-                            refs_data_urls.append(f"data:{mime};base64,{b64.strip()}")
 
+    # 构造 OpenAI chat messages（从 request_data 里还原）
+    messages = _build_openai_chat_messages_from_request_data(request_data, prompt)
+
+    # 比例字段规范化
     ratio_colon = ratio_for_api.replace("x", ":")
     if ratio_colon.lower() in {"auto", "自动", ""}:
-        ratio_colon = "1:1"
-
-    if refs_data_urls:
-        content: Any = [{"type": "image_url", "image_url": {"url": u}} for u in refs_data_urls]
-        content.append({"type": "text", "text": prompt})
-    else:
-        content = prompt
+        ratio_colon = ""
 
     submit_payload: Dict[str, Any] = {
         "model": model_name,
-        "messages": [{"role": "user", "content": content}],
-        "extra_body": {
-            "google": {
-                "image_config": {
-                    "aspectRatio": ratio_colon,
-                }
-            }
-        },
-        "aspect_ratio": ratio_colon,
+        "messages": messages,
     }
+
+    # 比例：同时提供多种位置/命名，上游识别其中任一即可生效
+    image_config: Dict[str, Any] = {}
+    if ratio_colon:
+        submit_payload["aspectRatio"] = ratio_colon
+        submit_payload["aspect_ratio"] = ratio_colon
+        image_config["aspectRatio"] = ratio_colon
+        image_config["aspect_ratio"] = ratio_colon
+
+    # 分辨率（1K/2K/4K）
+    if size_for_api in {"1K", "2K", "4K"}:
+        submit_payload["imageSize"] = size_for_api
+        submit_payload["image_size"] = size_for_api
+        submit_payload["size"] = size_for_api
+        image_config["imageSize"] = size_for_api
+        image_config["image_size"] = size_for_api
+
+    if image_config:
+        submit_payload["extra_body"] = {"google": {"image_config": image_config}}
+
     if seed_for_api >= 0:
         submit_payload["seed"] = seed_for_api
+
+    _log(f"Gemini async submit: model={model_name}, ratio={ratio_colon or 'auto'}, size={size_for_api or 'default'}")
 
     try:
         response = requests.post(
@@ -1757,8 +1758,147 @@ def _execute_gemini_via_async_gateway(task_payload: Dict[str, Any]) -> Tuple[Opt
     return tensor, "url", ""
 
 
+def _build_openai_chat_messages_from_request_data(request_data: Dict[str, Any], prompt: str) -> List[Dict[str, Any]]:
+    """把 _create_reference_gemini_request 产生的 contents.parts 还原成 OpenAI chat messages 结构。
+    parts 里的 inlineData -> image_url(data: 协议 base64);text -> text part。
+    """
+    content: List[Dict[str, Any]] = []
+
+    contents = request_data.get("contents") if isinstance(request_data, dict) else None
+    if isinstance(contents, list) and contents and isinstance(contents[0], dict):
+        parts = contents[0].get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline = part.get("inlineData") or part.get("inline_data")
+                if isinstance(inline, dict):
+                    b64 = inline.get("data")
+                    mime = str(inline.get("mimeType") or inline.get("mime_type") or "image/png")
+                    if isinstance(b64, str) and b64.strip():
+                        content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64.strip()}"},
+                        })
+                        continue
+                text_value = part.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    content.append({"type": "text", "text": text_value.strip()})
+
+    if not content:
+        # 兜底：至少有一个文本 part
+        content.append({"type": "text", "text": (prompt or "").strip() or "请生成图像"})
+
+    return [{"role": "user", "content": content}]
+
+
+def _execute_gemini_native_sync(task_payload: Dict[str, Any]) -> Tuple[Optional[torch.Tensor], str, str]:
+    """KR-Gemini生图（同步节点）的提交逻辑。
+
+    走 OpenAI 兼容的 /v1/chat/completions 路径，与下游其他客户端协议一致；
+    比例 / 分辨率字段同时塞多个常见位置，让上游用哪种 schema 都能命中：
+      - extra_body.google.image_config.aspectRatio + imageSize
+      - 顶层 aspectRatio / aspect_ratio / size / imageSize
+    """
+    api_key = str(task_payload.get("api_key", "") or "").strip()
+    model_name = str(task_payload.get("model_name", "") or "").strip()
+    prompt = str(task_payload.get("prompt", "") or "")
+    ratio_for_api = str(task_payload.get("ratio_for_api", "") or "").strip()
+    size_for_api = str(task_payload.get("size_for_api", "") or "").strip()
+    seed_for_api = int(task_payload.get("seed_for_api", -1))
+    request_data = task_payload.get("request_data") or {}
+
+    if not api_key or not model_name:
+        return None, "unknown", "missing model or api_key"
+
+    if not isinstance(request_data, dict) or not request_data.get("contents"):
+        return None, "unknown", "request_data is empty or invalid"
+
+    target_url = CHAT_COMPLETIONS_URL
+
+    # OpenAI chat 格式 messages
+    messages = _build_openai_chat_messages_from_request_data(request_data, prompt)
+
+    # 比例字段做规范化：协议里通常用 "9:16"（冒号）格式
+    ratio_colon = ratio_for_api.replace("x", ":") if ratio_for_api else ""
+    if ratio_colon.lower() in {"auto", "自动", ""}:
+        ratio_colon = ""
+
+    submit_payload: Dict[str, Any] = {
+        "model": model_name,
+        "messages": messages,
+    }
+
+    # 比例：同时提供多种位置/命名，上游识别其中任一即可生效
+    image_config: Dict[str, Any] = {}
+    if ratio_colon:
+        submit_payload["aspectRatio"] = ratio_colon          # 下游客户已验证可用的字段
+        submit_payload["aspect_ratio"] = ratio_colon         # 蛇形命名兜底
+        image_config["aspectRatio"] = ratio_colon
+        image_config["aspect_ratio"] = ratio_colon
+
+    # 分辨率（1K/2K/4K）
+    if size_for_api in {"1K", "2K", "4K"}:
+        submit_payload["imageSize"] = size_for_api
+        submit_payload["image_size"] = size_for_api
+        submit_payload["size"] = size_for_api
+        image_config["imageSize"] = size_for_api
+        image_config["image_size"] = size_for_api
+
+    if image_config:
+        submit_payload["extra_body"] = {"google": {"image_config": image_config}}
+
+    if seed_for_api >= 0:
+        submit_payload["seed"] = seed_for_api
+
+    _log(f"Gemini chat submit: model={model_name}, ratio={ratio_colon or 'auto'}, size={size_for_api or 'default'}")
+
+    try:
+        response = requests.post(
+            target_url,
+            headers=_make_headers(api_key),
+            json=submit_payload,
+            # connect=120s 给跨境 TLS + 上行大 body 留足余量；read=600s 等待最终结果
+            timeout=(120, 600),
+        )
+    except Exception as exc:
+        return None, "unknown", f"chat submit exception: {exc}"
+
+    if response.status_code not in (200, 201, 202):
+        return None, "unknown", f"chat submit HTTP {response.status_code}: {(response.text or '')[:400]}"
+
+    try:
+        payload = response.json()
+    except Exception:
+        return None, "unknown", f"chat submit non-json: {(response.text or '')[:400]}"
+
+    # 1) server.js 伪异步壳：OpenAI chat.completion 里 content 是 async_task JSON 字符串
+    task_id, query_url = _extract_async_task_info_from_chat_response(payload)
+    if task_id or query_url:
+        _log(f"Gemini chat got async wrapper: task_id={task_id}, query_url={query_url}, polling...")
+        tensor, err = _finalize_gemini_task_from_query(api_key, task_id, query_url)
+        if tensor is not None:
+            return tensor, "url", ""
+        return None, "unknown", err
+
+    # 2) 直接返回的 OpenAI 格式（content 里直接嵌图片 url / base64）
+    direct_images, _ = _extract_openai_images_from_response(payload, api_key)
+    if direct_images:
+        return direct_images[0], "url", ""
+
+    # 3) 兜底：上游若意外返回 Gemini 原生格式 candidates
+    images_b64, source = _extract_reference_gemini_images(payload)
+    if images_b64:
+        tensor = _decode_base64_image_to_tensor(images_b64[0])
+        if tensor is not None:
+            return tensor, "base64" if source == "base64" else "url", ""
+
+    return None, "unknown", f"no image in response: {json.dumps(payload, ensure_ascii=False)[:400]}"
+
+
 def _execute_gemini_image_task(task_payload: Dict[str, Any]) -> Tuple[Optional[torch.Tensor], str, str]:
-    tensor, result_format, error_message = _execute_gemini_via_async_gateway(task_payload)
+    # KR-Gemini生图(同步) 走 OpenAI chat/completions 协议，与下游其他客户端一致。
+    tensor, result_format, error_message = _execute_gemini_native_sync(task_payload)
     if tensor is not None:
         return tensor, result_format, ""
     return None, "unknown", error_message or "unknown error"
