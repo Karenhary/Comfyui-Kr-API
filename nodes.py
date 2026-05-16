@@ -278,6 +278,12 @@ GEMINI_ASYNC_QUEUE_LOCK = threading.Lock()
 GEMINI_ASYNC_WORKERS_STARTED = False
 GEMINI_ASYNC_WORKER_COUNT = 3
 
+OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE: List[Dict[str, Any]] = []
+OPENAI_IMAGE_ASYNC_TASK_QUEUE: List[Dict[str, Any]] = []
+OPENAI_IMAGE_ASYNC_QUEUE_LOCK = threading.Lock()
+OPENAI_IMAGE_ASYNC_WORKERS_STARTED = False
+OPENAI_IMAGE_ASYNC_WORKER_COUNT = 3
+
 
 def _log(message: str) -> None:
     print(f"[Comfyui-Kr-API] {message}")
@@ -2788,7 +2794,7 @@ class KROpenAIImageNode:
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
             },
             "optional": {
-                **{f"参考图{i}": ("IMAGE",) for i in range(1, 5)},
+                **{f"参考图{i}": ("IMAGE",) for i in range(1, 9)},
             },
         }
 
@@ -2988,7 +2994,7 @@ class KROpenAIImageNode:
         aspect_ratio = kwargs.get("比例", kwargs.get("aspect_ratio", "自动"))
         image_count = int(kwargs.get("输出数量", kwargs.get("n", 1)))
         seed = int(kwargs.get("种子", 0))
-        input_images = [kwargs.get(f"参考图{i}") for i in range(1, 5)]
+        input_images = [kwargs.get(f"参考图{i}") for i in range(1, 9)]
 
         if not (api_key or "").strip():
             return self._blank_result("API密钥为空，请填写后再试")
@@ -3111,6 +3117,262 @@ class KROpenAIImageNode:
         except Exception as exc:
             _log(f"OpenAI node exception: {exc}\n{traceback.format_exc(limit=2)}")
             return self._blank_result(f"执行失败: {exc}")
+
+
+def _openai_image_async_worker_loop(worker_name: str) -> None:
+    while True:
+        task: Optional[Dict[str, Any]] = None
+        with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+            if OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE:
+                task = OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE.pop(0)
+        if task is None:
+            time.sleep(0.1)
+            continue
+
+        try:
+            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                task["status"] = "RUNNING"
+                task["started_at"] = time.time()
+
+            api_key = str(task.get("api_key", "") or "").strip()
+            upstream_task_id = str(task.get("upstream_task_id", "") or "")
+            query_url = str(task.get("query_url", "") or "")
+
+            _log(f"OpenAI async[{worker_name}] start polling: id={task.get('task_id')}, upstream={upstream_task_id}")
+
+            if not upstream_task_id and not query_url:
+                pre_tensor = task.get("result_tensor")
+                if isinstance(pre_tensor, torch.Tensor):
+                    with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                        task["status"] = "DONE"
+                        task["result_format"] = "url"
+                        task["finished_at"] = time.time()
+                    _log(f"OpenAI async[{worker_name}] done(direct): id={task.get('task_id')}")
+                    continue
+                with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                    task["status"] = "FAILED"
+                    task["error"] = "missing upstream task_id"
+                    task["finished_at"] = time.time()
+                continue
+
+            tensor, err = _finalize_gemini_task_from_query(api_key, upstream_task_id, query_url)
+            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                if tensor is not None:
+                    task["status"] = "DONE"
+                    task["result_tensor"] = tensor
+                    task["result_format"] = "url"
+                    task["error"] = ""
+                    task["finished_at"] = time.time()
+                    _log(f"OpenAI async[{worker_name}] done: id={task.get('task_id')}")
+                else:
+                    task["status"] = "FAILED"
+                    task["error"] = err
+                    task["finished_at"] = time.time()
+                    _log(f"OpenAI async[{worker_name}] failed: id={task.get('task_id')}, error={err}")
+        except Exception as exc:
+            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                task["status"] = "FAILED"
+                task["error"] = f"worker exception: {exc}"
+                task["finished_at"] = time.time()
+            _log(f"OpenAI async[{worker_name}] exception: {exc}")
+
+
+def _ensure_openai_image_async_workers_started() -> None:
+    global OPENAI_IMAGE_ASYNC_WORKERS_STARTED
+    if OPENAI_IMAGE_ASYNC_WORKERS_STARTED:
+        return
+    with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+        if OPENAI_IMAGE_ASYNC_WORKERS_STARTED:
+            return
+        for i in range(OPENAI_IMAGE_ASYNC_WORKER_COUNT):
+            thread = threading.Thread(
+                target=_openai_image_async_worker_loop,
+                args=(f"OW{i + 1}",),
+                daemon=True,
+            )
+            thread.start()
+        OPENAI_IMAGE_ASYNC_WORKERS_STARTED = True
+        _log(f"OpenAI image async workers started: {OPENAI_IMAGE_ASYNC_WORKER_COUNT}")
+
+
+class KROpenAIImageAsyncSubmitNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return KROpenAIImageNode.INPUT_TYPES()
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("任务信息",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY_NAME
+    OUTPUT_NODE = True
+
+    def run(self, **kwargs):
+        _ensure_openai_image_async_workers_started()
+
+        prompt = kwargs.get("提示词", "")
+        model_preset = kwargs.get("模型预设", kwargs.get("model_preset", "GPT-Image2-2k"))
+        api_key = kwargs.get("API密钥", "")
+        aspect_ratio = kwargs.get("比例", kwargs.get("aspect_ratio", "自动"))
+        image_count = int(kwargs.get("输出数量", kwargs.get("n", 1)))
+        seed = int(kwargs.get("种子", 0))
+        input_images = [kwargs.get(f"参考图{i}") for i in range(1, 9)]
+
+        if not (api_key or "").strip():
+            return ("API密钥为空，请填写后再试",)
+
+        refs = [img for img in input_images if isinstance(img, torch.Tensor)]
+        node = KROpenAIImageNode()
+        ratio_value = node._resolve_ratio(aspect_ratio, refs)
+        ratio_value, _ = _kr_constrain_ratio_for_model(model_preset, ratio_value)
+
+        model_name = (model_preset or "").strip()
+        image_count = max(1, min(4, image_count))
+        ratio_colon = ratio_value if ratio_value not in {"自动", "auto", "Auto"} else "1:1"
+
+        task_ids: List[str] = []
+        errors: List[str] = []
+
+        for idx in range(image_count):
+            req_seed = (seed + idx) if seed > 0 else 0
+            if refs:
+                content: Any = [{"type": "image_url", "image_url": {"url": node._prepare_chat_image_data_url(ref)}} for ref in refs]
+                content.append({"type": "text", "text": (prompt or "").strip() or "请根据参考图生成图像"})
+            else:
+                content = (prompt or "").strip() or "请生成图像"
+
+            submit_payload: Dict[str, Any] = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": content}],
+                "aspectRatio": ratio_colon,
+                "aspect_ratio": ratio_colon,
+                "extra_body": {"google": {"image_config": {"aspectRatio": ratio_colon, "aspect_ratio": ratio_colon}}},
+            }
+            if req_seed > 0:
+                submit_payload["seed"] = req_seed
+
+            try:
+                submit = requests.post(
+                    CHAT_COMPLETIONS_URL,
+                    headers=_make_headers(api_key),
+                    json=submit_payload,
+                    timeout=(120, 600),
+                )
+            except Exception as exc:
+                errors.append(f"submit exception: {exc}")
+                continue
+
+            if submit.status_code not in (200, 201, 202):
+                errors.append(f"HTTP {submit.status_code}: {(submit.text or '')[:200]}")
+                continue
+
+            try:
+                submit_body = submit.json()
+            except Exception:
+                errors.append("non-json response")
+                continue
+
+            upstream_task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
+
+            local_task_id = str(uuid.uuid4())
+            task_entry: Dict[str, Any] = {
+                "task_id": local_task_id,
+                "api_key": api_key,
+                "upstream_task_id": upstream_task_id,
+                "query_url": query_url,
+                "status": "SUBMITTING",
+                "result_tensor": None,
+                "result_format": "unknown",
+                "error": "",
+                "created_at": time.time(),
+            }
+
+            if not upstream_task_id and not query_url:
+                direct_images, _ = _extract_openai_images_from_response(submit_body, api_key)
+                if direct_images:
+                    task_entry["result_tensor"] = direct_images[0]
+                    task_entry["status"] = "DONE"
+                    task_entry["result_format"] = "url"
+
+            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE.append(task_entry)
+                OPENAI_IMAGE_ASYNC_TASK_QUEUE.append(task_entry)
+
+            task_ids.append(local_task_id)
+
+        pending_count = len(OPENAI_IMAGE_ASYNC_TASK_QUEUE)
+        _log(f"OpenAI async submit: {len(task_ids)} tasks queued, errors={len(errors)}, total_queue={pending_count}")
+
+        message = (
+            f"OpenAI异步任务已提交\n"
+            f"提交成功: {len(task_ids)} 个\n"
+            f"model: {model_name}\n"
+            f"ratio: {ratio_colon}\n"
+            f"queue: {pending_count}"
+        )
+        if errors:
+            message += f"\n提交失败: {len(errors)} 个\n" + "\n".join(errors[:3])
+        return (message,)
+
+
+class KROpenAIImageAsyncFetchNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "最多等待秒数": ("INT", {"default": 300, "min": 1, "max": 1800}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("图像", "响应信息")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY_NAME
+
+    def run(self, **kwargs):
+        max_wait_seconds = int(kwargs.get("最多等待秒数", 300))
+        with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+            if not OPENAI_IMAGE_ASYNC_TASK_QUEUE:
+                return (_blank_image(), "OpenAI异步队列为空")
+            current_tasks = list(OPENAI_IMAGE_ASYNC_TASK_QUEUE)
+            OPENAI_IMAGE_ASYNC_TASK_QUEUE.clear()
+
+        images: List[torch.Tensor] = []
+        reports: List[str] = []
+        requeue_tasks: List[Dict[str, Any]] = []
+        wait_deadline = time.time() + float(max_wait_seconds)
+
+        for task in current_tasks:
+            task_id = str(task.get("task_id", ""))
+            while True:
+                status = str(task.get("status", ""))
+                if status in {"DONE", "FAILED"}:
+                    break
+                if time.time() >= wait_deadline:
+                    break
+                time.sleep(0.2)
+
+            status = str(task.get("status", ""))
+            if status == "DONE":
+                tensor = task.get("result_tensor")
+                if isinstance(tensor, torch.Tensor):
+                    images.append(tensor)
+                    reports.append(f"{task_id}: DONE")
+                else:
+                    reports.append(f"{task_id}: DONE but empty tensor")
+            elif status == "FAILED":
+                reports.append(f"{task_id}: FAILED - {task.get('error', 'unknown')}")
+            else:
+                requeue_tasks.append(task)
+                reports.append(f"{task_id}: {status or 'RUNNING'} (requeued)")
+
+        if requeue_tasks:
+            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+                OPENAI_IMAGE_ASYNC_TASK_QUEUE[0:0] = requeue_tasks
+
+        if not images:
+            return (_blank_image(), "\n".join(reports) if reports else "无可用结果")
+
+        return (_stack_images(images), "\n".join(reports))
 
 
 class KRVeoVideoNode:
@@ -3302,6 +3564,8 @@ NODE_CLASS_MAPPINGS = {
     "KRGeminiImageAsyncSubmitNode": KRGeminiImageAsyncSubmitNode,
     "KRGeminiImageAsyncFetchNode": KRGeminiImageAsyncFetchNode,
     "KROpenAIImageNode": KROpenAIImageNode,
+    "KROpenAIImageAsyncSubmitNode": KROpenAIImageAsyncSubmitNode,
+    "KROpenAIImageAsyncFetchNode": KROpenAIImageAsyncFetchNode,
     "KRVeoVideoNode": KRVeoVideoNode,
 }
 
@@ -3311,6 +3575,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KRGeminiImageAsyncSubmitNode": "KR-Gemini异步提交",
     "KRGeminiImageAsyncFetchNode": "KR-Gemini异步获取",
     "KROpenAIImageNode": "KR-OpenAI\u751f\u56fe",
+    "KROpenAIImageAsyncSubmitNode": "KR-OpenAI异步提交",
+    "KROpenAIImageAsyncFetchNode": "KR-OpenAI异步获取",
     "KRVeoVideoNode": "KR-Veo3.1\u89c6\u9891",
 }
 
