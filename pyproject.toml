@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-kr-api"
+description = "KR API 中转 ComfyUI 插件：在 ComfyUI 里直接调用 LLM、Gemini 生图、OpenAI 生图、Veo 视频等服务的节点合集。"
+version = "1.0.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28.0",
+    "Pillow>=9.0.0",
+    "numpy>=1.21.0",
+]
+
+[project.urls]
+Repository = "https://github.com/Karenhary/Comfyui-Kr-API"
+
+[tool.comfy]
+PublisherId = "karenhary"
+DisplayName = "Comfyui-Kr-API"
+Icon = ""
