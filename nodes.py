@@ -3729,9 +3729,10 @@ GPT_IMAGE2_RESOLUTION_OPTIONS = [
 ]
 
 GPT_IMAGE2_QUALITY_OPTIONS = [
-    "auto",
-    "high",
-    "low",
+    "高",
+    "中等",
+    "低",
+    "自动",
 ]
 
 GPT_IMAGE2_FORMAT_OPTIONS = [
@@ -3745,7 +3746,7 @@ def _gpt_image2_resolve_size(aspect_ratio: str, resolution: str) -> str:
     """根据比例 + 分辨率档位计算 宽x高（16 的倍数）。
     长边由分辨率决定：1K=1024, 2K=2048, 4K=3840。
     """
-    res_map = {"1K": 1024, "2K": 2048, "4K": 3840}
+    res_map = {"1K": 1024, "2K": 2048, "4K": 3072}
     long_side = res_map.get((resolution or "2K").strip().upper(), 2048)
 
     ratio = (aspect_ratio or "").strip()
@@ -3779,6 +3780,14 @@ def _gpt_image2_resolve_size(aspect_ratio: str, resolution: str) -> str:
     w = max(16, (w // 16) * 16)
     h = max(16, (h // 16) * 16)
 
+    # 像素预算检查：上游限制总像素不超过 8,294,400
+    max_pixels = 8_294_400
+    while w * h > max_pixels:
+        w = (w - 16) if w >= h else w
+        h = (h - 16) if h > w else h
+        w = max(16, (w // 16) * 16)
+        h = max(16, (h // 16) * 16)
+
     return f"{w}x{h}"
 
 
@@ -3796,7 +3805,7 @@ class KRGPTImage2Node:
                 "提示词": ("STRING", {"multiline": True, "default": ""}),
                 "比例": (GPT_IMAGE2_ASPECT_RATIO_OPTIONS, {"default": "自动"}),
                 "分辨率": (GPT_IMAGE2_RESOLUTION_OPTIONS, {"default": "2K"}),
-                "质量": (GPT_IMAGE2_QUALITY_OPTIONS, {"default": "auto"}),
+                "质量": (GPT_IMAGE2_QUALITY_OPTIONS, {"default": "高"}),
                 "输出格式": (GPT_IMAGE2_FORMAT_OPTIONS, {"default": "png"}),
                 "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
@@ -3813,7 +3822,9 @@ class KRGPTImage2Node:
         prompt = (kwargs.get("提示词", "") or "").strip()
         aspect_ratio = (kwargs.get("比例", "自动") or "").strip()
         resolution = (kwargs.get("分辨率", "2K") or "").strip()
-        quality = (kwargs.get("质量", "auto") or "").strip()
+        quality = (kwargs.get("质量", "高") or "").strip()
+        quality_map = {"高": "high", "中等": "medium", "低": "low", "自动": "auto"}
+        quality_value = quality_map.get(quality, "high")
         output_format = (kwargs.get("输出格式", "png") or "").strip()
         seed = int(kwargs.get("种子", 0))
         api_key = (kwargs.get("API密钥", "") or "").strip()
@@ -3838,9 +3849,9 @@ class KRGPTImage2Node:
 
         # 判断走 generations 还是 edits
         if refs:
-            return self._run_edits(prompt, size, quality, output_format, seed, api_key, refs)
+            return self._run_edits(prompt, size, quality_value, output_format, seed, api_key, refs)
         else:
-            return self._run_generations(prompt, size, quality, output_format, seed, api_key)
+            return self._run_generations(prompt, size, quality_value, output_format, seed, api_key)
 
     def _run_generations(self, prompt, size, quality, output_format, seed, api_key):
         """文生图：POST /v1/images/generations"""
