@@ -1726,11 +1726,11 @@ def _submit_gemini_task_to_gateway(task_payload: Dict[str, Any]) -> Tuple[str, s
     return task_id, query_url, None, ""
 
 
-def _finalize_gemini_task_from_query(api_key: str, task_id: str, query_url: str) -> Tuple[Optional[torch.Tensor], str]:
+def _finalize_gemini_task_from_query(api_key: str, task_id: str, query_url: str, max_attempts: int = 200) -> Tuple[Optional[torch.Tensor], str]:
     """轮询 + 下载结果。可在子线程或主线程调用。
     返回值：(tensor or None, error_message)
     """
-    final_payload = _poll_gemini_async_task(api_key, task_id, query_url=query_url, max_attempts=200, interval_sec=3.0)
+    final_payload = _poll_gemini_async_task(api_key, task_id, query_url=query_url, max_attempts=max_attempts, interval_sec=3.0)
     final_status = str((final_payload or {}).get("status", "")).strip().lower()
     result_urls = _extract_async_image_result_urls(final_payload)
 
@@ -3850,6 +3850,7 @@ class KRGPTImage2Node:
                 "质量": (GPT_IMAGE2_QUALITY_OPTIONS, {"default": "高"}),
                 "输出格式": (GPT_IMAGE2_FORMAT_OPTIONS, {"default": "png"}),
                 "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
+                "最大等待秒数": ("INT", {"default": 600, "min": 30, "max": 3600}),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
             },
             "optional": optional_images,
@@ -3869,6 +3870,7 @@ class KRGPTImage2Node:
         quality_value = quality_map.get(quality, "high")
         output_format = (kwargs.get("输出格式", "png") or "").strip()
         seed = int(kwargs.get("种子", 0))
+        max_wait = int(kwargs.get("最大等待秒数", 600))
         api_key = (kwargs.get("API密钥", "") or "").strip()
 
         if not api_key:
@@ -3899,11 +3901,11 @@ class KRGPTImage2Node:
 
         # 判断走 generations 还是 edits
         if refs:
-            return self._run_edits(prompt, size, quality_value, output_format, seed, api_key, refs)
+            return self._run_edits(prompt, size, quality_value, output_format, seed, api_key, refs, max_wait)
         else:
-            return self._run_generations(prompt, size, quality_value, output_format, seed, api_key)
+            return self._run_generations(prompt, size, quality_value, output_format, seed, api_key, max_wait)
 
-    def _run_generations(self, prompt, size, quality, output_format, seed, api_key):
+    def _run_generations(self, prompt, size, quality, output_format, seed, api_key, max_wait=600):
         """文生图：POST /v1/images/generations"""
         payload: Dict[str, Any] = {
             "model": "gpt-image-2",
@@ -3921,10 +3923,11 @@ class KRGPTImage2Node:
             path="/v1/images/generations",
             payload=payload,
             api_key=api_key,
+            max_wait=max_wait,
         )
         return result
 
-    def _run_edits(self, prompt, size, quality, output_format, seed, api_key, refs):
+    def _run_edits(self, prompt, size, quality, output_format, seed, api_key, refs, max_wait=600):
         """图生图：POST /v1/images/edits（JSON 格式，用 image_url base64）"""
         # 把参考图编码成 data URL
         image_urls: List[Dict[str, str]] = []
@@ -3949,10 +3952,11 @@ class KRGPTImage2Node:
             path="/v1/images/edits",
             payload=payload,
             api_key=api_key,
+            max_wait=max_wait,
         )
         return result
 
-    def _submit_and_poll(self, path: str, payload: Dict[str, Any], api_key: str):
+    def _submit_and_poll(self, path: str, payload: Dict[str, Any], api_key: str, max_wait: int = 600):
         """提交到 server.js 伪异步通道,轮询拿结果。"""
         submit_url = CHAT_COMPLETIONS_URL.replace("/v1/chat/completions", path)
 
@@ -4011,10 +4015,11 @@ class KRGPTImage2Node:
             _log(f"GPT-Image-2: no task_id in response: {json.dumps(submit_body, ensure_ascii=False)[:400]}")
             return (_blank_image(1024),)
 
-        _log(f"GPT-Image-2 task created: {task_id}, polling...")
+        _log(f"GPT-Image-2 task created: {task_id}, polling (max_wait={max_wait}s)...")
 
-        # 3) 轮询
-        tensor, err = _finalize_gemini_task_from_query(api_key, task_id, query_url)
+        # 3) 轮询（按 max_wait 计算最大轮询次数,间隔 3 秒）
+        max_attempts = max(1, max_wait // 3)
+        tensor, err = _finalize_gemini_task_from_query(api_key, task_id, query_url, max_attempts=max_attempts)
         if tensor is not None:
             hw = _get_image_hw(tensor)
             if hw:
