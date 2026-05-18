@@ -1673,20 +1673,16 @@ def _submit_gemini_task_to_gateway(task_payload: Dict[str, Any]) -> Tuple[str, s
         "messages": messages,
     }
 
-    # 比例：同时提供多种位置/命名，上游识别其中任一即可生效
+    # 比例：统一蛇形命名
     image_config: Dict[str, Any] = {}
     if ratio_colon:
-        submit_payload["aspectRatio"] = ratio_colon
         submit_payload["aspect_ratio"] = ratio_colon
-        image_config["aspectRatio"] = ratio_colon
         image_config["aspect_ratio"] = ratio_colon
 
     # 分辨率（1K/2K/4K）
     if size_for_api in {"1K", "2K", "4K"}:
-        submit_payload["imageSize"] = size_for_api
         submit_payload["image_size"] = size_for_api
         submit_payload["size"] = size_for_api
-        image_config["imageSize"] = size_for_api
         image_config["image_size"] = size_for_api
 
     if image_config:
@@ -1835,20 +1831,16 @@ def _execute_gemini_native_sync(task_payload: Dict[str, Any]) -> Tuple[Optional[
         "messages": messages,
     }
 
-    # 比例：同时提供多种位置/命名，上游识别其中任一即可生效
+    # 比例：统一蛇形命名
     image_config: Dict[str, Any] = {}
     if ratio_colon:
-        submit_payload["aspectRatio"] = ratio_colon          # 下游客户已验证可用的字段
-        submit_payload["aspect_ratio"] = ratio_colon         # 蛇形命名兜底
-        image_config["aspectRatio"] = ratio_colon
+        submit_payload["aspect_ratio"] = ratio_colon
         image_config["aspect_ratio"] = ratio_colon
 
     # 分辨率（1K/2K/4K）
     if size_for_api in {"1K", "2K", "4K"}:
-        submit_payload["imageSize"] = size_for_api
         submit_payload["image_size"] = size_for_api
         submit_payload["size"] = size_for_api
-        image_config["imageSize"] = size_for_api
         image_config["image_size"] = size_for_api
 
     if image_config:
@@ -3036,7 +3028,7 @@ class KROpenAIImageNode:
                     "extra_body": {
                         "google": {
                             "image_config": {
-                                "aspectRatio": ratio_colon,
+                                "aspect_ratio": ratio_colon,
                             }
                         }
                     },
@@ -3198,10 +3190,10 @@ def _ensure_openai_image_async_workers_started() -> None:
         _log(f"OpenAI image async workers started: {OPENAI_IMAGE_ASYNC_WORKER_COUNT}")
 
 
-class KROpenAIImageAsyncSubmitNode:
+class KRGPTImage2AsyncSubmitNode:
     @classmethod
     def INPUT_TYPES(cls):
-        return KROpenAIImageNode.INPUT_TYPES()
+        return KRGPTImage2Node.INPUT_TYPES()
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("任务信息",)
@@ -3212,112 +3204,140 @@ class KROpenAIImageAsyncSubmitNode:
     def run(self, **kwargs):
         _ensure_openai_image_async_workers_started()
 
-        prompt = kwargs.get("提示词", "")
-        model_preset = kwargs.get("模型预设", kwargs.get("model_preset", "GPT-Image2-2k"))
-        api_key = kwargs.get("API密钥", "")
-        aspect_ratio = kwargs.get("比例", kwargs.get("aspect_ratio", "自动"))
-        image_count = int(kwargs.get("输出数量", kwargs.get("n", 1)))
+        prompt = (kwargs.get("提示词", "") or "").strip()
+        aspect_ratio = (kwargs.get("比例", "自动") or "").strip()
+        resolution = (kwargs.get("分辨率", "2K") or "").strip()
+        quality = (kwargs.get("质量", "高") or "").strip()
+        quality_map = {"高": "high", "中等": "medium", "低": "low", "自动": "auto"}
+        quality_value = quality_map.get(quality, "high")
+        output_format = (kwargs.get("输出格式", "png") or "").strip()
         seed = int(kwargs.get("种子", 0))
-        input_images = [kwargs.get(f"参考图{i}") for i in range(1, 9)]
+        api_key = (kwargs.get("API密钥", "") or "").strip()
 
-        if not (api_key or "").strip():
+        if not api_key:
             return ("API密钥为空，请填写后再试",)
+        if not prompt:
+            return ("提示词为空",)
 
-        refs = [img for img in input_images if isinstance(img, torch.Tensor)]
-        node = KROpenAIImageNode()
-        ratio_value = node._resolve_ratio(aspect_ratio, refs)
-        ratio_value, _ = _kr_constrain_ratio_for_model(model_preset, ratio_value)
+        # 收集参考图
+        refs: List[torch.Tensor] = []
+        for i in range(1, 15):
+            img = kwargs.get(f"参考图{i}")
+            if isinstance(img, torch.Tensor):
+                refs.append(img)
 
-        model_name = (model_preset or "").strip()
-        image_count = max(1, min(4, image_count))
-        ratio_colon = ratio_value if ratio_value not in {"自动", "auto", "Auto"} else "1:1"
-
-        task_ids: List[str] = []
-        errors: List[str] = []
-
-        for idx in range(image_count):
-            req_seed = (seed + idx) if seed > 0 else 0
+        # 比例为"自动"时,如果有参考图,根据第一张参考图的宽高比自动匹配
+        if aspect_ratio in {"自动", "auto", ""}:
             if refs:
-                content: Any = [{"type": "image_url", "image_url": {"url": node._prepare_chat_image_data_url(ref)}} for ref in refs]
-                content.append({"type": "text", "text": (prompt or "").strip() or "请根据参考图生成图像"})
-            else:
-                content = (prompt or "").strip() or "请生成图像"
+                best = _choose_best_aspect_ratio_from_options(refs[0], GPT_IMAGE2_ASPECT_RATIO_OPTIONS)
+                if best and best not in {"自动"}:
+                    aspect_ratio = best
+                    _log(f"GPT-Image-2 async auto ratio from reference image: {aspect_ratio}")
 
-            submit_payload: Dict[str, Any] = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": content}],
-                "aspectRatio": ratio_colon,
-                "aspect_ratio": ratio_colon,
-                "extra_body": {"google": {"image_config": {"aspectRatio": ratio_colon, "aspect_ratio": ratio_colon}}},
+        size = _gpt_image2_resolve_size(aspect_ratio, resolution)
+
+        # 构造 payload
+        if refs:
+            image_urls: List[Dict[str, str]] = []
+            for ref in refs:
+                data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=90)
+                image_urls.append({"image_url": data_url})
+            payload: Dict[str, Any] = {
+                "model": "gpt-image-2",
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+                "quality": quality_value,
+                "output_format": output_format,
+                "images": image_urls,
             }
-            if req_seed > 0:
-                submit_payload["seed"] = req_seed
-
-            try:
-                submit = requests.post(
-                    CHAT_COMPLETIONS_URL,
-                    headers=_make_headers(api_key),
-                    json=submit_payload,
-                    timeout=(120, 600),
-                )
-            except Exception as exc:
-                errors.append(f"submit exception: {exc}")
-                continue
-
-            if submit.status_code not in (200, 201, 202):
-                errors.append(f"HTTP {submit.status_code}: {(submit.text or '')[:200]}")
-                continue
-
-            try:
-                submit_body = submit.json()
-            except Exception:
-                errors.append("non-json response")
-                continue
-
-            upstream_task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
-
-            local_task_id = str(uuid.uuid4())
-            task_entry: Dict[str, Any] = {
-                "task_id": local_task_id,
-                "api_key": api_key,
-                "upstream_task_id": upstream_task_id,
-                "query_url": query_url,
-                "status": "SUBMITTING",
-                "result_tensor": None,
-                "result_format": "unknown",
-                "error": "",
-                "created_at": time.time(),
+            path = "/v1/images/edits"
+        else:
+            payload = {
+                "model": "gpt-image-2",
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+                "quality": quality_value,
+                "output_format": output_format,
             }
+            path = "/v1/images/generations"
 
-            if not upstream_task_id and not query_url:
-                direct_images, _ = _extract_openai_images_from_response(submit_body, api_key)
-                if direct_images:
-                    task_entry["result_tensor"] = direct_images[0]
-                    task_entry["status"] = "DONE"
-                    task_entry["result_format"] = "url"
+        submit_url = CHAT_COMPLETIONS_URL.replace("/v1/chat/completions", path)
 
-            with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
-                OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE.append(task_entry)
-                OPENAI_IMAGE_ASYNC_TASK_QUEUE.append(task_entry)
+        _log(f"GPT-Image-2 async submit: path={path}, size={size}, refs={len(refs)}")
 
-            task_ids.append(local_task_id)
+        try:
+            resp = requests.post(submit_url, headers=_make_headers(api_key), json=payload, timeout=(120, 600))
+        except Exception as exc:
+            return (f"提交失败: {exc}",)
 
-        pending_count = len(OPENAI_IMAGE_ASYNC_TASK_QUEUE)
-        _log(f"OpenAI async submit: {len(task_ids)} tasks queued, errors={len(errors)}, total_queue={pending_count}")
+        if resp.status_code not in (200, 201, 202):
+            return (f"提交失败: HTTP {resp.status_code}: {(resp.text or '')[:300]}",)
+
+        try:
+            submit_body = resp.json()
+        except Exception:
+            return (f"提交失败: non-json response",)
+
+        # 提取 task_id
+        upstream_task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
+        if not upstream_task_id and not query_url:
+            upstream_task_id = str(submit_body.get("task_id") or submit_body.get("id") or "").strip()
+            if upstream_task_id and not query_url:
+                query_url = f"{OPENAI_API_ROOT.rstrip('/')}/task/{upstream_task_id}"
+
+        local_task_id = str(uuid.uuid4())
+        task_entry: Dict[str, Any] = {
+            "task_id": local_task_id,
+            "api_key": api_key,
+            "upstream_task_id": upstream_task_id,
+            "query_url": query_url,
+            "status": "SUBMITTING",
+            "result_tensor": None,
+            "result_format": "unknown",
+            "error": "",
+            "created_at": time.time(),
+        }
+
+        # 可能直接返回了图片
+        if not upstream_task_id and not query_url:
+            if isinstance(submit_body, dict) and submit_body.get("data"):
+                data_list = submit_body.get("data", [])
+                if isinstance(data_list, list) and data_list:
+                    item = data_list[0]
+                    b64 = item.get("b64_json")
+                    if b64:
+                        tensor = _decode_base64_image_to_tensor(b64)
+                        if tensor is not None:
+                            task_entry["result_tensor"] = tensor
+                            task_entry["status"] = "DONE"
+                            task_entry["result_format"] = "url"
+
+            direct_images, _ = _extract_openai_images_from_response(submit_body, api_key)
+            if direct_images and task_entry["status"] != "DONE":
+                task_entry["result_tensor"] = direct_images[0]
+                task_entry["status"] = "DONE"
+                task_entry["result_format"] = "url"
+
+        with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
+            OPENAI_IMAGE_ASYNC_SUBMISSION_QUEUE.append(task_entry)
+            OPENAI_IMAGE_ASYNC_TASK_QUEUE.append(task_entry)
+            pending_count = len(OPENAI_IMAGE_ASYNC_TASK_QUEUE)
+
+        _log(f"GPT-Image-2 async task queued: id={local_task_id}, upstream={upstream_task_id or 'direct'}")
 
         message = (
-            f"OpenAI异步任务已提交\n"
-            f"提交成功: {len(task_ids)} 个\n"
-            f"model: {model_name}\n"
-            f"ratio: {ratio_colon}\n"
+            f"GPT-Image-2异步任务已提交\n"
+            f"task_id: {local_task_id}\n"
+            f"size: {size}\n"
+            f"refs: {len(refs)}\n"
             f"queue: {pending_count}"
         )
-        if errors:
-            message += f"\n提交失败: {len(errors)} 个\n" + "\n".join(errors[:3])
         return (message,)
 
 
-class KROpenAIImageAsyncFetchNode:
+class KRGPTImage2AsyncFetchNode:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -3335,7 +3355,7 @@ class KROpenAIImageAsyncFetchNode:
         max_wait_seconds = int(kwargs.get("最多等待秒数", 300))
         with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
             if not OPENAI_IMAGE_ASYNC_TASK_QUEUE:
-                return (_blank_image(), "OpenAI异步队列为空")
+                return (_blank_image(), "GPT-Image-2异步队列为空")
             current_tasks = list(OPENAI_IMAGE_ASYNC_TASK_QUEUE)
             OPENAI_IMAGE_ASYNC_TASK_QUEUE.clear()
 
@@ -3743,52 +3763,74 @@ GPT_IMAGE2_FORMAT_OPTIONS = [
 
 
 def _gpt_image2_resolve_size(aspect_ratio: str, resolution: str) -> str:
-    """根据比例 + 分辨率档位计算 宽x高（16 的倍数）。
-    长边由分辨率决定：1K=1024, 2K=2048, 4K=3840。
+    """根据比例 + 分辨率档位,计算最优尺寸。
+    规则:
+      - 宽高都是 16 的倍数
+      - 长边不超过 3840
+      - 总像素在 655,360 ~ 8,294,400 之间
+      - 1K/2K/4K 分别对应约 1M/4M/8M 像素
     """
-    res_map = {"1K": 1024, "2K": 2048, "4K": 3072}
-    long_side = res_map.get((resolution or "2K").strip().upper(), 2048)
+    import math
+
+    # 目标总像素
+    pixel_targets = {"1K": 1_048_576, "2K": 4_194_304, "4K": 8_294_400}
+    max_pixels = 8_294_400
+    min_pixels = 655_360
+    max_long_side = 3840
 
     ratio = (aspect_ratio or "").strip()
     if ratio in {"自动", "auto", ""}:
         ratio = "1:1"
 
+    res = (resolution or "2K").strip().upper()
+    if res not in {"1K", "2K", "4K"}:
+        res = "2K"
+
+    # 解析比例
     parts = ratio.split(":")
     if len(parts) != 2:
-        return f"{long_side}x{long_side}"
-
+        return "2048x2048"
     try:
         w_ratio = float(parts[0])
         h_ratio = float(parts[1])
     except ValueError:
-        return f"{long_side}x{long_side}"
-
+        return "2048x2048"
     if w_ratio <= 0 or h_ratio <= 0:
-        return f"{long_side}x{long_side}"
+        return "2048x2048"
 
-    # 确定哪边是长边
-    if w_ratio >= h_ratio:
-        # 横图或正方形,宽是长边
-        w = long_side
-        h = int(round(long_side * h_ratio / w_ratio))
-    else:
-        # 竖图,高是长边
-        h = long_side
-        w = int(round(long_side * w_ratio / h_ratio))
+    target_pixels = pixel_targets[res]
+
+    # 计算: w = sqrt(P * w_ratio / h_ratio), h = sqrt(P * h_ratio / w_ratio)
+    w = math.sqrt(target_pixels * w_ratio / h_ratio)
+    h = math.sqrt(target_pixels * h_ratio / w_ratio)
 
     # 取 16 的倍数
-    w = max(16, (w // 16) * 16)
-    h = max(16, (h // 16) * 16)
+    w = max(16, round(w / 16) * 16)
+    h = max(16, round(h / 16) * 16)
 
-    # 像素预算检查：上游限制总像素不超过 8,294,400
-    max_pixels = 8_294_400
+    # 长边不超过 3840
+    long_side = max(w, h)
+    if long_side > max_long_side:
+        scale = max_long_side / long_side
+        w = max(16, round(w * scale / 16) * 16)
+        h = max(16, round(h * scale / 16) * 16)
+
+    # 总像素检查
     while w * h > max_pixels:
-        w = (w - 16) if w >= h else w
-        h = (h - 16) if h > w else h
-        w = max(16, (w // 16) * 16)
-        h = max(16, (h // 16) * 16)
+        if w >= h:
+            w -= 16
+        else:
+            h -= 16
+        w = max(16, w)
+        h = max(16, h)
 
-    return f"{w}x{h}"
+    while w * h < min_pixels:
+        if w <= h:
+            w += 16
+        else:
+            h += 16
+
+    return f"{int(w)}x{int(h)}"
 
 
 class KRGPTImage2Node:
@@ -3799,7 +3841,7 @@ class KRGPTImage2Node:
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional_images = {f"参考图{i}": ("IMAGE",) for i in range(1, 9)}
+        optional_images = {f"参考图{i}": ("IMAGE",) for i in range(1, 15)}
         return {
             "required": {
                 "提示词": ("STRING", {"multiline": True, "default": ""}),
@@ -3837,15 +3879,23 @@ class KRGPTImage2Node:
             _log("GPT-Image-2: 提示词为空")
             return (_blank_image(1024),)
 
-        # 根据比例 + 分辨率计算实际尺寸
-        size = _gpt_image2_resolve_size(aspect_ratio, resolution)
-
         # 收集参考图
         refs: List[torch.Tensor] = []
-        for i in range(1, 9):
+        for i in range(1, 15):
             img = kwargs.get(f"参考图{i}")
             if isinstance(img, torch.Tensor):
                 refs.append(img)
+
+        # 比例为"自动"时,如果有参考图,根据第一张参考图的宽高比自动匹配
+        if aspect_ratio in {"自动", "auto", ""}:
+            if refs:
+                best = _choose_best_aspect_ratio_from_options(refs[0], GPT_IMAGE2_ASPECT_RATIO_OPTIONS)
+                if best and best not in {"自动"}:
+                    aspect_ratio = best
+                    _log(f"GPT-Image-2 auto ratio from reference image: {aspect_ratio}")
+
+        # 根据比例 + 分辨率计算实际尺寸
+        size = _gpt_image2_resolve_size(aspect_ratio, resolution)
 
         # 判断走 generations 还是 edits
         if refs:
@@ -3981,8 +4031,8 @@ NODE_CLASS_MAPPINGS = {
     "KRGeminiImageAsyncSubmitNode": KRGeminiImageAsyncSubmitNode,
     "KRGeminiImageAsyncFetchNode": KRGeminiImageAsyncFetchNode,
     "KROpenAIImageNode": KROpenAIImageNode,
-    "KROpenAIImageAsyncSubmitNode": KROpenAIImageAsyncSubmitNode,
-    "KROpenAIImageAsyncFetchNode": KROpenAIImageAsyncFetchNode,
+    "KROpenAIImageAsyncSubmitNode": KRGPTImage2AsyncSubmitNode,
+    "KROpenAIImageAsyncFetchNode": KRGPTImage2AsyncFetchNode,
     "KRGPTImage2Node": KRGPTImage2Node,
     "KRVeoImageToVideoNode": KRVeoImageToVideoNode,
     "KRVeoKeyframeVideoNode": KRVeoKeyframeVideoNode,
@@ -3994,8 +4044,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KRGeminiImageAsyncSubmitNode": "KR-Gemini异步提交",
     "KRGeminiImageAsyncFetchNode": "KR-Gemini异步获取",
     "KROpenAIImageNode": "KR-OpenAI\u751f\u56fe",
-    "KROpenAIImageAsyncSubmitNode": "KR-OpenAI异步提交",
-    "KROpenAIImageAsyncFetchNode": "KR-OpenAI异步获取",
+    "KROpenAIImageAsyncSubmitNode": "KR-GPT-Image-2异步提交",
+    "KROpenAIImageAsyncFetchNode": "KR-GPT-Image-2异步获取",
     "KRGPTImage2Node": "KR-GPT-Image-2\u751f\u56fe",
     "KRVeoImageToVideoNode": "KR-Veo图生视频",
     "KRVeoKeyframeVideoNode": "KR-Veo首尾帧视频",
