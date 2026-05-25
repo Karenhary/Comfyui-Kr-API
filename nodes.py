@@ -1,5 +1,6 @@
 ﻿import base64
 import binascii
+import contextvars
 import io
 import json
 import math
@@ -21,6 +22,33 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
+
+_BYPASS_PROXY_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar("kr_bypass_proxy", default=True)
+
+
+def _set_bypass_proxy(enabled: bool) -> None:
+    _BYPASS_PROXY_CTX.set(bool(enabled))
+
+
+def _is_bypass_proxy() -> bool:
+    try:
+        return bool(_BYPASS_PROXY_CTX.get())
+    except Exception:
+        return True
+
+
+def _requests_proxy_kwargs() -> Dict[str, Any]:
+    if _is_bypass_proxy():
+        return {"proxies": {"http": None, "https": None}}
+    return {}
+
+
+def _http_get(url: str, **kwargs) -> requests.Response:
+    return requests.get(url, **_requests_proxy_kwargs(), **kwargs)
+
+
+def _http_post(url: str, **kwargs) -> requests.Response:
+    return requests.post(url, **_requests_proxy_kwargs(), **kwargs)
 
 try:
     from comfy_api.latest import VideoFromFile
@@ -360,7 +388,7 @@ class KRVideoAdapter:
             return False
         try:
             if self.is_url:
-                response = requests.get(self.video_url, stream=True, timeout=(30, 300))
+                response = _http_get(self.video_url, stream=True, timeout=(30, 300))
                 response.raise_for_status()
                 with open(output_path, "wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -397,6 +425,15 @@ def _make_headers(api_key: str) -> Dict[str, str]:
         "Authorization": f"Bearer {key}",
         "X-API-Key": key,
         "X-Banana-Client": "comfyui-kr-api",
+    }
+
+
+def _make_openai_compat_headers(api_key: str) -> Dict[str, str]:
+    key = (api_key or "").strip()
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
     }
 
 
@@ -520,40 +557,40 @@ def _pil_to_tensor(image: Image.Image) -> torch.Tensor:
 
 
 def _tensor_to_data_url(image_tensor: torch.Tensor) -> str:
-    image = _tensor_to_pil(image_tensor)
+    image = _tensor_to_pil(image_tensor).convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="JPEG", quality=100)
     encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{encoded}"
+    return f"data:image/jpeg;base64,{encoded}"
 
 
 def _tensor_to_inline_data(image_tensor: torch.Tensor) -> Dict[str, str]:
-    image = _tensor_to_pil(image_tensor)
+    image = _tensor_to_pil(image_tensor).convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="JPEG", quality=100)
     encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
     return {
-        "mimeType": "image/png",
+        "mimeType": "image/jpeg",
         "data": encoded,
     }
 
 
 def _tensor_to_base64(image_tensor: torch.Tensor) -> str:
-    image = _tensor_to_pil(image_tensor)
+    image = _tensor_to_pil(image_tensor).convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="JPEG", quality=100)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _tensor_to_base64_jpeg(image_tensor: torch.Tensor, quality: int = 95) -> str:
+def _tensor_to_base64_jpeg(image_tensor: torch.Tensor, quality: int = 100) -> str:
     image = _tensor_to_pil(image_tensor).convert("RGB")
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=quality, optimize=True)
+    image.save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _download_image_to_tensor(url: str, timeout_sec: int = 90) -> torch.Tensor:
-    response = requests.get(url, timeout=timeout_sec)
+    response = _http_get(url, timeout=timeout_sec)
     response.raise_for_status()
     image = Image.open(io.BytesIO(response.content)).convert("RGB")
     return _pil_to_tensor(image)
@@ -570,7 +607,7 @@ def _decode_base64_image_to_tensor(data: str) -> Optional[torch.Tensor]:
 
 def _download_image_to_base64(url: str, timeout_sec: int = 30) -> Optional[str]:
     try:
-        response = requests.get(
+        response = _http_get(
             url,
             headers={
                 "User-Agent": "Mozilla/5.0",
@@ -589,7 +626,7 @@ def _download_video_to_temp(video_url: str, timeout_sec: int = 600, headers: Opt
     if not url:
         return None
     try:
-        response = requests.get(url, stream=True, headers=headers or {}, timeout=(30, timeout_sec))
+        response = _http_get(url, stream=True, headers=headers or {}, timeout=(30, timeout_sec))
         response.raise_for_status()
         tmp_dir = os.path.join(tempfile.gettempdir(), "comfyui_kr_api_videos")
         os.makedirs(tmp_dir, exist_ok=True)
@@ -616,7 +653,7 @@ def _download_video_content_by_id(api_key: str, task_id: str, timeout_sec: int =
         return None
     content_url = f"{OPENAI_API_V1}/videos/{task}/content"
     try:
-        response = requests.get(content_url, headers={"Authorization": f"Bearer {(api_key or '').strip()}"}, stream=True, timeout=(30, timeout_sec))
+        response = _http_get(content_url, headers={"Authorization": f"Bearer {(api_key or '').strip()}"}, stream=True, timeout=(30, timeout_sec))
         if response.status_code != 200:
             _log(f"video content endpoint failed: http={response.status_code}, body={(response.text or '')[:220]}")
             return None
@@ -639,7 +676,7 @@ def _download_grok_video_content_by_id(api_key: str, task_id: str, timeout_sec: 
         return None
     content_url = f"{GROK_VIDEO_QUERY_URL}/{task}/content"
     try:
-        response = requests.get(
+        response = _http_get(
             content_url,
             headers={"Authorization": f"Bearer {(api_key or '').strip()}"},
             stream=True,
@@ -699,7 +736,7 @@ def _download_video_content_by_file_id(api_key: str, file_id: str, timeout_sec: 
         return None
     content_url = f"{GROK_API_V1}/files/{fid}/content"
     try:
-        response = requests.get(
+        response = _http_get(
             content_url,
             headers={"Authorization": f"Bearer {(api_key or '').strip()}"},
             stream=True,
@@ -721,7 +758,7 @@ def _download_video_content_by_file_id(api_key: str, file_id: str, timeout_sec: 
         return None
 
 
-def _tensor_to_compressed_jpeg_data_url(image_tensor: torch.Tensor, max_long_side: int = 1024, quality: int = 85) -> str:
+def _tensor_to_compressed_jpeg_data_url(image_tensor: torch.Tensor, max_long_side: int = 1024, quality: int = 100) -> str:
     frame = image_tensor[0:1] if image_tensor.dim() == 4 else image_tensor.unsqueeze(0)
     image = _tensor_to_pil(frame).convert("RGB")
     w, h = image.size
@@ -733,7 +770,7 @@ def _tensor_to_compressed_jpeg_data_url(image_tensor: torch.Tensor, max_long_sid
         resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
         image = image.resize((new_w, new_h), resampling)
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=quality, optimize=True)
+    image.save(buf, format="JPEG", quality=quality)
     encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{encoded}"
 
@@ -756,6 +793,96 @@ def _extract_text_from_content(content: Any) -> str:
         if isinstance(text, str):
             return text.strip()
     return ""
+
+
+def _format_response_debug(response: requests.Response, raw_text: str, limit: int = 800) -> str:
+    content_type = response.headers.get("content-type", "")
+    body = (raw_text or "").strip()
+    body = body[:limit] if body else "<empty>"
+    return f"HTTP {response.status_code}, content-type={content_type or 'unknown'}, body={body}"
+
+
+def _extract_text_from_chat_response_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        collected: List[str] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                text = _extract_text_from_content(message.get("content", ""))
+                if text:
+                    collected.append(text)
+                    continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                text = _extract_text_from_content(delta.get("content", ""))
+                if text:
+                    collected.append(text)
+                    continue
+            text = choice.get("text")
+            if isinstance(text, str) and text.strip():
+                collected.append(text.strip())
+        if collected:
+            return "\n".join(collected).strip()
+
+    text = _extract_text_from_content(payload.get("content", ""))
+    if text:
+        return text
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        collected = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_text = _extract_text_from_content(item.get("content", ""))
+            if item_text:
+                collected.append(item_text)
+        if collected:
+            return "\n".join(collected).strip()
+
+    return ""
+
+
+def _extract_text_from_chat_sse(raw_text: str) -> Tuple[str, str]:
+    collected: List[str] = []
+    last_error = ""
+    saw_chunk = False
+    for raw_line in (raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            last_error = line[:300]
+            continue
+        if isinstance(payload, dict):
+            obj = str(payload.get("object", "") or "").strip().lower()
+            if obj == "chat.completion.chunk":
+                saw_chunk = True
+        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+            last_error = json.dumps(payload.get("error"), ensure_ascii=False)[:800]
+            continue
+        text = _extract_text_from_chat_response_payload(payload)
+        if text:
+            collected.append(text)
+    if not collected and not last_error and saw_chunk:
+        last_error = "upstream returned stream chunks but no content text (empty delta)"
+    return "\n".join(collected).strip(), last_error
 
 
 def _extract_url_from_text(text: str) -> Optional[str]:
@@ -1063,7 +1190,7 @@ def _build_generate_content_urls(base_url: str, model_name: str) -> List[str]:
 
 def _post_json(url: str, api_key: str, payload: Dict[str, Any], timeout: Tuple[int, int]) -> requests.Response:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    return requests.post(url, headers=_make_headers(api_key), data=body, timeout=timeout)
+    return _http_post(url, headers=_make_headers(api_key), data=body, timeout=timeout)
 
 
 def _extract_image_tensor_from_response(data: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -1110,6 +1237,31 @@ def _extract_image_tensor_from_response(data: Dict[str, Any]) -> Optional[torch.
     return None
 
 
+def _image_task_query_url(task_id: str) -> str:
+    return f"{OPENAI_API_V1}/images/tasks/{str(task_id or '').strip()}"
+
+
+def _extract_native_image_task_info(payload: Any) -> Tuple[str, str]:
+    task_id = ""
+    if isinstance(payload, dict):
+        for key in ("task_id", "id", "taskId"):
+            value = payload.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                task_id = str(value).strip()
+                break
+
+        if not task_id:
+            data = payload.get("data")
+            if isinstance(data, dict):
+                for key in ("task_id", "id", "taskId"):
+                    value = data.get(key)
+                    if isinstance(value, (str, int)) and str(value).strip():
+                        task_id = str(value).strip()
+                        break
+
+    return task_id, _image_task_query_url(task_id) if task_id else ""
+
+
 def _create_reference_gemini_request(
     prompt: str,
     seed: int,
@@ -1149,7 +1301,7 @@ def _create_reference_gemini_request(
         parts.append(
             {
                 "inlineData": {
-                    "mimeType": "image/png",
+                    "mimeType": "image/jpeg",
                     "data": encoded,
                 }
             }
@@ -1430,7 +1582,7 @@ def _execute_gemini_stream_compat_task(task_payload: Dict[str, Any]) -> Tuple[Op
     }
 
     try:
-        response = requests.post(
+        response = _http_post(
             CHAT_COMPLETIONS_URL,
             headers=headers,
             json=payload,
@@ -1553,34 +1705,36 @@ def _extract_async_task_info_from_chat_response(payload: Any) -> Tuple[str, str]
             query_url = str(parsed.get("query_url") or query_url).strip()
 
     if task_id and not query_url:
-        query_url = f"{OPENAI_API_ROOT.rstrip('/')}/task/{task_id}"
+        query_url = _image_task_query_url(task_id)
     return task_id, query_url
 
 
 def _extract_async_image_result_urls(payload: Any) -> List[str]:
     urls: List[str] = []
-    if isinstance(payload, dict):
-        value = payload.get("url")
-        if isinstance(value, str) and value.startswith(("http://", "https://")):
-            urls.append(value)
-        arr = payload.get("urls")
-        if isinstance(arr, list):
-            for v in arr:
-                if isinstance(v, str) and v.startswith(("http://", "https://")):
-                    urls.append(v)
-        result = payload.get("result")
-        if isinstance(result, dict):
-            value = result.get("url")
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                urls.append(value)
-            arr = result.get("urls")
-            if isinstance(arr, list):
-                for v in arr:
-                    if isinstance(v, str) and v.startswith(("http://", "https://")):
-                        urls.append(v)
-        content = payload.get("content")
-        if isinstance(content, str):
-            urls.extend(_extract_urls_from_text(content, OPENAI_API_ROOT.rstrip("/")))
+
+    def scan(node: Any, key: str = "", depth: int = 0) -> None:
+        if depth > 12 or node is None:
+            return
+        if isinstance(node, dict):
+            for child_key, value in node.items():
+                scan(value, str(child_key), depth + 1)
+            return
+        if isinstance(node, list):
+            for item in node:
+                scan(item, key, depth + 1)
+            return
+        if not isinstance(node, str):
+            return
+
+        text = node.strip()
+        if not text:
+            return
+        if key in {"url", "image_url", "content", "text", "fileUri", "file_uri"}:
+            if text.startswith(("http://", "https://")):
+                urls.append(text)
+            urls.extend(_extract_urls_from_text(text, OPENAI_API_ROOT.rstrip("/")))
+
+    scan(payload)
     dedup: List[str] = []
     seen: set[str] = set()
     for u in urls:
@@ -1597,14 +1751,13 @@ def _poll_gemini_async_task(
     max_attempts: int = 300,
     interval_sec: float = 3.0,
 ) -> Dict[str, Any]:
-    base = OPENAI_API_ROOT.rstrip("/")
-    q_url = (query_url or "").strip() or f"{base}/task/{task_id}"
+    q_url = (query_url or "").strip() or _image_task_query_url(task_id)
     headers = {"Authorization": f"Bearer {(api_key or '').strip()}"}
     last_payload: Dict[str, Any] = {}
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(q_url, headers=headers, timeout=(20, 120))
+            response = _http_get(q_url, headers=headers, timeout=(20, 120))
             if response.status_code != 200:
                 _log(
                     f"Gemini task poll failed: attempt={attempt}, "
@@ -1638,89 +1791,50 @@ def _poll_gemini_async_task(
 
 
 def _submit_gemini_task_to_gateway(task_payload: Dict[str, Any]) -> Tuple[str, str, Optional[torch.Tensor], str]:
-    """主线程调用：发起提交 POST，拿到 task_id / query_url。
-    上游极少数情况会直接返回图片（非异步 task），此时返回的 tensor 不为 None。
-    返回值：(task_id, query_url, direct_tensor, error_message)
-        - 成功拿到 task_id：(task_id, query_url, None, "")
-        - 直接返图：("", "", tensor, "")
-        - 失败：("", "", None, "...错误信息...")
-
-    走 OpenAI chat/completions 协议，与同步节点和下游其他客户端一致。
-    比例 / 分辨率字段同时塞多个常见位置，让上游用哪种 schema 都能命中。
-    """
+    """Submit Gemini image requests through the native generateContent async route."""
     model_name = str(task_payload.get("model_name", "") or "").strip()
     api_key = str(task_payload.get("api_key", "") or "").strip()
-    prompt = str(task_payload.get("prompt", "") or "").strip() or "请根据参考图生成图像"
-    ratio_for_api = str(task_payload.get("ratio_for_api", "1:1") or "1:1").strip()
-    size_for_api = str(task_payload.get("size_for_api", "") or "").strip()
-    seed_for_api = int(task_payload.get("seed_for_api", -1))
 
     if not model_name or not api_key:
         return "", "", None, "missing model or api_key"
 
     request_data = task_payload.get("request_data") or {}
+    if not isinstance(request_data, dict) or not request_data.get("contents"):
+        return "", "", None, "request_data is empty or invalid"
 
-    # 构造 OpenAI chat messages（从 request_data 里还原）
-    messages = _build_openai_chat_messages_from_request_data(request_data, prompt)
-
-    # 比例字段规范化
-    ratio_colon = ratio_for_api.replace("x", ":")
-    if ratio_colon.lower() in {"auto", "自动", ""}:
-        ratio_colon = ""
-
-    submit_payload: Dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-    }
-
-    # 比例：统一蛇形命名
-    image_config: Dict[str, Any] = {}
-    if ratio_colon:
-        submit_payload["aspect_ratio"] = ratio_colon
-        image_config["aspect_ratio"] = ratio_colon
-
-    # 分辨率（1K/2K/4K）
-    if size_for_api in {"1K", "2K", "4K"}:
-        submit_payload["image_size"] = size_for_api
-        submit_payload["size"] = size_for_api
-        image_config["image_size"] = size_for_api
-
-    if image_config:
-        submit_payload["extra_body"] = {"google": {"image_config": image_config}}
-
-    if seed_for_api >= 0:
-        submit_payload["seed"] = seed_for_api
-
-    _log(f"Gemini async submit: model={model_name}, ratio={ratio_colon or 'auto'}, size={size_for_api or 'default'}")
+    target_url = _build_generate_content_url(BASE_URL, model_name)
+    _log(
+        f"Gemini native async submit: model={model_name}, "
+        f"ratio={task_payload.get('ratio_for_api')}, size={task_payload.get('size_for_api')}"
+    )
 
     try:
-        response = requests.post(
-            CHAT_COMPLETIONS_URL,
+        response = _http_post(
+            target_url,
             headers=_make_headers(api_key),
-            json=submit_payload,
-            # connect=120s 给跨境 TLS + 上行大 body 留足余量；read=600s 等待 server.js 立即返回 task_id
+            json=request_data,
             timeout=(120, 600),
         )
     except Exception as exc:
-        return "", "", None, f"async submit exception: {exc}"
+        return "", "", None, f"native async submit exception: {exc}"
 
     if response.status_code not in (200, 201, 202):
-        return "", "", None, f"async submit HTTP {response.status_code}: {(response.text or '')[:400]}"
+        return "", "", None, f"native async submit HTTP {response.status_code}: {(response.text or '')[:400]}"
 
     try:
         payload = response.json()
     except Exception:
-        return "", "", None, f"async submit non-json: {(response.text or '')[:400]}"
+        return "", "", None, f"native async submit non-json: {(response.text or '')[:400]}"
 
-    task_id, query_url = _extract_async_task_info_from_chat_response(payload)
+    task_id, query_url = _extract_native_image_task_info(payload)
     if not task_id and not query_url:
-        direct_images, _ = _extract_openai_images_from_response(payload, api_key)
-        if direct_images:
-            return "", "", direct_images[0], ""
-        return "", "", None, f"submit response has no task info: {json.dumps(payload, ensure_ascii=False)[:400]}"
+        tensor = _extract_image_tensor_from_response(payload)
+        if tensor is not None:
+            return "", "", tensor, ""
+        return "", "", None, f"native submit response has no task info: {json.dumps(payload, ensure_ascii=False)[:400]}"
 
     _log(
-        f"Gemini async task created: {task_id or 'unknown'}, "
+        f"Gemini native async task created: {task_id or 'unknown'}, "
         f"query_url={query_url or 'empty'}"
     )
     return task_id, query_url, None, ""
@@ -1795,107 +1909,12 @@ def _build_openai_chat_messages_from_request_data(request_data: Dict[str, Any], 
 
 
 def _execute_gemini_native_sync(task_payload: Dict[str, Any]) -> Tuple[Optional[torch.Tensor], str, str]:
-    """KR-Gemini生图（同步节点）的提交逻辑。
-
-    走 OpenAI 兼容的 /v1/chat/completions 路径，与下游其他客户端协议一致；
-    比例 / 分辨率字段同时塞多个常见位置，让上游用哪种 schema 都能命中：
-      - extra_body.google.image_config.aspectRatio + imageSize
-      - 顶层 aspectRatio / aspect_ratio / size / imageSize
-    """
-    api_key = str(task_payload.get("api_key", "") or "").strip()
-    model_name = str(task_payload.get("model_name", "") or "").strip()
-    prompt = str(task_payload.get("prompt", "") or "")
-    ratio_for_api = str(task_payload.get("ratio_for_api", "") or "").strip()
-    size_for_api = str(task_payload.get("size_for_api", "") or "").strip()
-    seed_for_api = int(task_payload.get("seed_for_api", -1))
-    request_data = task_payload.get("request_data") or {}
-
-    if not api_key or not model_name:
-        return None, "unknown", "missing model or api_key"
-
-    if not isinstance(request_data, dict) or not request_data.get("contents"):
-        return None, "unknown", "request_data is empty or invalid"
-
-    target_url = CHAT_COMPLETIONS_URL
-
-    # OpenAI chat 格式 messages
-    messages = _build_openai_chat_messages_from_request_data(request_data, prompt)
-
-    # 比例字段做规范化：协议里通常用 "9:16"（冒号）格式
-    ratio_colon = ratio_for_api.replace("x", ":") if ratio_for_api else ""
-    if ratio_colon.lower() in {"auto", "自动", ""}:
-        ratio_colon = ""
-
-    submit_payload: Dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-    }
-
-    # 比例：统一蛇形命名
-    image_config: Dict[str, Any] = {}
-    if ratio_colon:
-        submit_payload["aspect_ratio"] = ratio_colon
-        image_config["aspect_ratio"] = ratio_colon
-
-    # 分辨率（1K/2K/4K）
-    if size_for_api in {"1K", "2K", "4K"}:
-        submit_payload["image_size"] = size_for_api
-        submit_payload["size"] = size_for_api
-        image_config["image_size"] = size_for_api
-
-    if image_config:
-        submit_payload["extra_body"] = {"google": {"image_config": image_config}}
-
-    if seed_for_api >= 0:
-        submit_payload["seed"] = seed_for_api
-
-    _log(f"Gemini chat submit: model={model_name}, ratio={ratio_colon or 'auto'}, size={size_for_api or 'default'}")
-
-    try:
-        response = requests.post(
-            target_url,
-            headers=_make_headers(api_key),
-            json=submit_payload,
-            # connect=120s 给跨境 TLS + 上行大 body 留足余量；read=600s 等待最终结果
-            timeout=(120, 600),
-        )
-    except Exception as exc:
-        return None, "unknown", f"chat submit exception: {exc}"
-
-    if response.status_code not in (200, 201, 202):
-        return None, "unknown", f"chat submit HTTP {response.status_code}: {(response.text or '')[:400]}"
-
-    try:
-        payload = response.json()
-    except Exception:
-        return None, "unknown", f"chat submit non-json: {(response.text or '')[:400]}"
-
-    # 1) server.js 伪异步壳：OpenAI chat.completion 里 content 是 async_task JSON 字符串
-    task_id, query_url = _extract_async_task_info_from_chat_response(payload)
-    if task_id or query_url:
-        _log(f"Gemini chat got async wrapper: task_id={task_id}, query_url={query_url}, polling...")
-        tensor, err = _finalize_gemini_task_from_query(api_key, task_id, query_url)
-        if tensor is not None:
-            return tensor, "url", ""
-        return None, "unknown", err
-
-    # 2) 直接返回的 OpenAI 格式（content 里直接嵌图片 url / base64）
-    direct_images, _ = _extract_openai_images_from_response(payload, api_key)
-    if direct_images:
-        return direct_images[0], "url", ""
-
-    # 3) 兜底：上游若意外返回 Gemini 原生格式 candidates
-    images_b64, source = _extract_reference_gemini_images(payload)
-    if images_b64:
-        tensor = _decode_base64_image_to_tensor(images_b64[0])
-        if tensor is not None:
-            return tensor, "base64" if source == "base64" else "url", ""
-
-    return None, "unknown", f"no image in response: {json.dumps(payload, ensure_ascii=False)[:400]}"
+    """KR-Gemini sync node: submit a native async task, then poll it locally."""
+    return _execute_gemini_via_async_gateway(task_payload)
 
 
 def _execute_gemini_image_task(task_payload: Dict[str, Any]) -> Tuple[Optional[torch.Tensor], str, str]:
-    # KR-Gemini生图(同步) 走 OpenAI chat/completions 协议，与下游其他客户端一致。
+    # KR-Gemini生图(同步) 也强制走 Gemini 原生异步任务，再在节点内部轮询拿图。
     tensor, result_format, error_message = _execute_gemini_native_sync(task_payload)
     if tensor is not None:
         return tensor, result_format, ""
@@ -1915,6 +1934,7 @@ def _gemini_async_worker_loop(worker_name: str) -> None:
         try:
             _set_gemini_async_task_state(task, status="RUNNING", started_at=time.time())
             payload = task.get("task_payload") or {}
+            _set_bypass_proxy(bool(task.get("bypass_proxy", payload.get("绕过代理", True))))
             api_key = str(payload.get("api_key", "") or "").strip()
             upstream_task_id = str(task.get("upstream_task_id", "") or "")
             query_url = str(task.get("query_url", "") or "")
@@ -2012,6 +2032,7 @@ class KRLLMNode:
                 "模型预设": (LLM_MODEL_PRESETS, {"default": "【R】gemini-3-pro-preview"}),
                 "自定义模型": ("STRING", {"multiline": False, "default": ""}),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             },
             "optional": optional_images,
         }
@@ -2023,6 +2044,7 @@ class KRLLMNode:
     OUTPUT_NODE = True
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         system_prompt = kwargs.get("系统提示词", kwargs.get("system_prompt", "You are a helpful assistant."))
         user_prompt = kwargs.get("用户提示词", kwargs.get("user_prompt", ""))
         model_preset = kwargs.get("模型预设", kwargs.get("model_preset", "【R】gemini-3-pro-preview"))
@@ -2046,7 +2068,7 @@ class KRLLMNode:
                 content_parts.append(
                     {
                         "type": "image_url",
-                        "image_url": {"url": _tensor_to_data_url(image_input)},
+                        "image_url": {"url": _tensor_to_compressed_jpeg_data_url(image_input, max_long_side=1024, quality=100)},
                     }
                 )
                 ref_count += 1
@@ -2069,7 +2091,7 @@ class KRLLMNode:
             ],
         }
         try:
-            response = requests.post(CHAT_COMPLETIONS_URL, headers=_make_headers(api_key), json=payload, timeout=(30, 180))
+            response = _http_post(CHAT_COMPLETIONS_URL, headers=_make_headers(api_key), json=payload, timeout=(30, 180))
             if response.status_code != 200:
                 return (f"[Comfyui-Kr-API] request failed: HTTP {response.status_code} - {response.text[:300]}",)
             data = response.json()
@@ -2080,6 +2102,175 @@ class KRLLMNode:
             content = message.get("content", "")
             text = _extract_text_from_content(content)
             return (text if text else json.dumps(message, ensure_ascii=False),)
+        except Exception as exc:
+            return (f"[Comfyui-Kr-API] request exception: {exc}",)
+
+
+class KRGPTLanguageNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "系统提示词": ("STRING", {"multiline": True, "default": "You are a helpful assistant."}),
+                "规则填写": ("STRING", {"multiline": True, "default": ""}),
+                "自定义模型": ("STRING", {"multiline": False, "default": "gpt-4o"}),
+                "API密钥": ("STRING", {"multiline": False, "default": ""}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
+                "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
+            },
+            "optional": {
+                "图片": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("\u6587\u672c",)
+    FUNCTION = "run"
+    CATEGORY = CATEGORY_NAME
+    OUTPUT_NODE = True
+
+    def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
+        system_prompt = str(kwargs.get("系统提示词", kwargs.get("system_prompt", "")) or "").strip()
+        if not system_prompt:
+            system_prompt = "You are a helpful assistant."
+        rules = ""
+        for key in ("规则填写", "rules", "prompt", "提示词", "用户提示词", "user_prompt"):
+            value = kwargs.get(key)
+            if isinstance(value, str) and value.strip():
+                rules = value.strip()
+                break
+        model_name = str(kwargs.get("自定义模型", kwargs.get("custom_model", "gpt-4o")) or "").strip()
+        api_key = kwargs.get("API密钥", kwargs.get("api_key", ""))
+        seed = int(kwargs.get("种子", kwargs.get("seed", 0)))
+        image_input = kwargs.get("图片", kwargs.get("image"))
+
+        if not (api_key or "").strip():
+            return ("[Comfyui-Kr-API] api_key is required.",)
+        if not model_name:
+            return ("[Comfyui-Kr-API] custom model is required.",)
+
+        has_image = isinstance(image_input, torch.Tensor)
+        rules_text = str(rules or "").strip()
+        if not rules_text and not has_image:
+            return ("[Comfyui-Kr-API] 规则填写 or 图片 is required.",)
+
+        user_content: Any
+        if has_image:
+            content_parts: List[Dict[str, Any]] = []
+            if rules_text:
+                content_parts.append({"type": "text", "text": rules_text})
+            else:
+                content_parts.append({"type": "text", "text": "请根据图片生成文本。"})
+            try:
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": _tensor_to_compressed_jpeg_data_url(image_input, max_long_side=1024, quality=100),
+                            "detail": "low",
+                        },
+                    }
+                )
+            except Exception as exc:
+                _log(f"GPT language image encode failed: {exc}")
+                return (f"[Comfyui-Kr-API] image encode failed: {exc}",)
+            user_content = content_parts
+        else:
+            user_content = rules_text
+
+        payload: Dict[str, Any] = {
+            "model": model_name,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        if seed > 0:
+            payload["seed"] = seed % 2147483647
+
+        _log(f"GPT language request: model={model_name}, image={1 if has_image else 0}, seed={payload.get('seed', 'none')}")
+
+        try:
+            response = _kr_post_json_with_fallback(
+                CHAT_COMPLETIONS_URL,
+                headers=_make_openai_compat_headers(api_key),
+                payload=payload,
+                timeout=(120, 300),
+            )
+            raw_text = response.text or ""
+            if response.status_code != 200:
+                return (f"[Comfyui-Kr-API] request failed: {_format_response_debug(response, raw_text)}",)
+            if not raw_text.strip():
+                return (f"[Comfyui-Kr-API] request failed: {_format_response_debug(response, raw_text)}",)
+
+            content_type = response.headers.get("content-type", "").lower()
+            looks_like_sse = (
+                "text/event-stream" in content_type
+                or raw_text.lstrip().startswith("data:")
+                or "\ndata:" in raw_text
+                or "data: [DONE]" in raw_text
+                or '"object":"chat.completion.chunk"' in raw_text
+            )
+            if looks_like_sse:
+                stream_text, stream_error = _extract_text_from_chat_sse(raw_text)
+                if stream_text:
+                    return (stream_text,)
+
+                # Some OpenAI-compatible upstreams send SSE wrappers with empty delta content
+                # in non-stream mode. Retry once with an explicit non-stream payload.
+                _log(
+                    "KRLLMNode stream-like response has no text, retrying with explicit non-stream. "
+                    f"err={stream_error or raw_text[:220]}"
+                )
+                payload_retry = dict(payload)
+                payload_retry["stream"] = False
+                response_retry = _kr_post_json_with_fallback(
+                    CHAT_COMPLETIONS_URL,
+                    headers=_make_openai_compat_headers(api_key),
+                    payload=payload_retry,
+                    timeout=(120, 300),
+                )
+                retry_text = response_retry.text or ""
+                if response_retry.status_code != 200:
+                    return (
+                        "[Comfyui-Kr-API] stream parse failed and non-stream retry failed: "
+                        + _format_response_debug(response_retry, retry_text)
+                    ,)
+                try:
+                    retry_data = response_retry.json()
+                    parsed_text = _extract_text_from_chat_response_payload(retry_data)
+                    if parsed_text:
+                        return (parsed_text,)
+                    return (json.dumps(retry_data, ensure_ascii=False),)
+                except Exception:
+                    if "data:" in retry_text or "[DONE]" in retry_text or "chat.completion.chunk" in retry_text:
+                        retry_stream_text, retry_stream_error = _extract_text_from_chat_sse(retry_text)
+                        if retry_stream_text:
+                            return (retry_stream_text,)
+                    return (
+                        f"[Comfyui-Kr-API] stream response has no text (retry): "
+                        f"{retry_stream_error if 'retry_stream_error' in locals() else _format_response_debug(response_retry, retry_text)}",
+                    )
+
+            try:
+                data = response.json()
+            except ValueError:
+                # Defensive fallback: some upstreams return SSE body with wrong content-type.
+                if "data:" in raw_text or "[DONE]" in raw_text or "chat.completion.chunk" in raw_text:
+                    stream_text, stream_error = _extract_text_from_chat_sse(raw_text)
+                    if stream_text:
+                        return (stream_text,)
+                    return (f"[Comfyui-Kr-API] stream response has no text: {stream_error or raw_text[:800]}",)
+                return (raw_text.strip() if raw_text.strip() else f"[Comfyui-Kr-API] non-json response: {_format_response_debug(response, raw_text)}",)
+
+            text = _extract_text_from_chat_response_payload(data)
+            if text:
+                return (text,)
+            if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                return (f"[Comfyui-Kr-API] request failed: {json.dumps(data.get('error'), ensure_ascii=False)}",)
+            return (json.dumps(data, ensure_ascii=False),)
         except Exception as exc:
             return (f"[Comfyui-Kr-API] request exception: {exc}",)
 
@@ -2097,6 +2288,7 @@ class KRGeminiImageNode:
                 "图像尺寸": (GEMINI_IMAGE_SIZE_PRESETS, {"default": "4K"}),
                 "图像比例": (GEMINI_ASPECT_RATIO_OPTIONS, {"default": AUTO_LABEL}),
                 "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             },
             "optional": optional_images,
         }
@@ -2107,6 +2299,7 @@ class KRGeminiImageNode:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = kwargs.get("prompt", kwargs.get("提示词", ""))
         model_preset = kwargs.get("模型预设", kwargs.get("model_preset", "【X】gemini-3.1-flash-image-preview"))
         custom_model = kwargs.get("自定义模型", kwargs.get("custom_model", ""))
@@ -2207,6 +2400,7 @@ class KRGeminiImageAsyncSubmitNode:
     OUTPUT_NODE = True
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         _ensure_gemini_async_workers_started()
         task_payload, error = _prepare_gemini_image_task_from_kwargs(kwargs)
         if task_payload is None:
@@ -2227,6 +2421,7 @@ class KRGeminiImageAsyncSubmitNode:
             "result_format": "unknown",
             "error": "",
             "created_at": time.time(),
+            "bypass_proxy": bool(kwargs.get("绕过代理", True)),
         }
 
         # 提交本身就失败（401/网络错误等）：直接置为 FAILED，无需进队列
@@ -2271,6 +2466,7 @@ class KRGeminiImageAsyncFetchNode:
         return {
             "required": {
                 "最多等待秒数": ("INT", {"default": 300, "min": 1, "max": 1800}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -2280,6 +2476,7 @@ class KRGeminiImageAsyncFetchNode:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         max_wait_seconds = int(kwargs.get("最多等待秒数", 300))
         with GEMINI_ASYNC_QUEUE_LOCK:
             if not GEMINI_ASYNC_TASK_QUEUE:
@@ -2364,7 +2561,7 @@ def _download_openai_url_bytes(url: str, api_key: str, timeout_sec: int = 120) -
         }
         if host in {"ai.krapi.cn", "154.44.9.184", "localhost", "127.0.0.1"}:
             headers["Authorization"] = f"Bearer {(api_key or '').strip()}"
-        response = requests.get(
+        response = _http_get(
             url,
             headers=headers,
             timeout=timeout_sec,
@@ -2474,10 +2671,10 @@ def _extract_openai_status_and_payload(body: Any) -> Tuple[str, Any]:
 
 
 def _poll_openai_task_result(api_key: str, task_id: str, max_attempts: int = 90, interval_sec: float = 2.0) -> Any:
-    query_url = f"{OPENAI_API_V1}/images/tasks/{task_id}"
+    query_url = _image_task_query_url(task_id)
     last_body: Any = None
     for _ in range(max_attempts):
-        response = requests.get(query_url, headers=_make_headers(api_key), timeout=(15, 120))
+        response = _http_get(query_url, headers=_make_headers(api_key), timeout=(15, 120))
         if response.status_code != 200:
             time.sleep(interval_sec)
             continue
@@ -2646,7 +2843,7 @@ def _poll_veo_video_task(api_key: str, task_id: str, max_attempts: int = 300, in
             (VEO_VIDEO_LEGACY_QUERY_URL, {"task_id": task_id}),
         ]
         for query_url, query_params in query_targets:
-            response = requests.get(query_url, headers=_make_headers(api_key), params=query_params, timeout=(15, 120))
+            response = _http_get(query_url, headers=_make_headers(api_key), params=query_params, timeout=(15, 120))
             if response.status_code == 200:
                 break
 
@@ -2686,7 +2883,7 @@ def _poll_grok_video_task(api_key: str, task_id: str, max_attempts: int = 300, i
     query_url = f"{GROK_VIDEO_QUERY_URL}/{task_id}"
     req_headers = {"Authorization": f"Bearer {(api_key or '').strip()}"}
     for attempt in range(1, max_attempts + 1):
-        response = requests.get(query_url, headers=req_headers, timeout=(15, 120))
+        response = _http_get(query_url, headers=req_headers, timeout=(15, 120))
         if response.status_code != 200:
             failed_code = response.status_code
             failed_body = (response.text or "")[:220]
@@ -2752,7 +2949,7 @@ def _poll_kling_image2video_task(api_key: str, task_id: str, max_attempts: int =
     last_payload: Dict[str, Any] = {}
     query_url = f"{KLING_IMAGE2VIDEO_QUERY_URL}/{task_id}"
     for attempt in range(1, max_attempts + 1):
-        response = requests.get(query_url, headers=_make_headers(api_key), timeout=(15, 120))
+        response = _http_get(query_url, headers=_make_headers(api_key), timeout=(15, 120))
         if response.status_code != 200:
             _log(f"Kling poll failed: attempt={attempt}, http={response.status_code}, body={(response.text or '')[:220]}")
             time.sleep(interval_sec)
@@ -2775,343 +2972,6 @@ def _poll_kling_image2video_task(api_key: str, task_id: str, max_attempts: int =
 
     raise RuntimeError(f"可灵任务轮询超时: {json.dumps(last_payload, ensure_ascii=False)[:500]}")
 
-
-class KROpenAIImageNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "提示词": ("STRING", {"multiline": True, "default": ""}),
-                "模型预设": (OPENAI_IMAGE_MODEL_PRESETS, {"default": "GPT-Image2-2k"}),
-                "比例": (OPENAI_IMAGE_ASPECT_RATIO_OPTIONS, {"default": "自动"}),
-                "输出数量": ("INT", {"default": 1, "min": 1, "max": 4}),
-                "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
-                "API密钥": ("STRING", {"multiline": False, "default": ""}),
-            },
-            "optional": {
-                **{f"参考图{i}": ("IMAGE",) for i in range(1, 9)},
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("图像",)
-    FUNCTION = "run"
-    CATEGORY = CATEGORY_NAME
-
-    def _blank_result(self, message: str):
-        _log(message)
-        return (_blank_image(1024),)
-
-    def _prepare_chat_image_data_url(self, image_tensor: torch.Tensor) -> str:
-        frame = image_tensor[0:1] if image_tensor.dim() == 4 else image_tensor.unsqueeze(0)
-        image = _tensor_to_pil(frame).convert("RGB")
-
-        max_long_side = 1024
-        w, h = image.size
-        long_side = max(w, h)
-        if long_side > max_long_side and long_side > 0:
-            scale = float(max_long_side) / float(long_side)
-            new_w = max(16, int(round(w * scale)))
-            new_h = max(16, int(round(h * scale)))
-            resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-            image = image.resize((new_w, new_h), resampling)
-
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=85, optimize=True)
-        encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{encoded}"
-
-    def _build_chat_payload(
-        self,
-        prompt: str,
-        model_name: str,
-        ratio_value: str,
-        refs: List[torch.Tensor],
-        image_count: int,
-        seed: int,
-    ) -> Dict[str, Any]:
-        message_content: List[Dict[str, Any]] = []
-        for ref in refs:
-            message_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._prepare_chat_image_data_url(ref)},
-                }
-            )
-        message_content.append({"type": "text", "text": (prompt or "").strip() or " "})
-
-        payload: Dict[str, Any] = {
-            "model": model_name,
-            "size": _ratio_colon_to_x(ratio_value),
-            "aspect_ratio": _ratio_colon_to_x(ratio_value),
-            "messages": [{"role": "user", "content": message_content}],
-            "stream": True,
-            # Some upstream chat-image channels return only one URL per stream.
-            # We keep n=1 and do multi-request batching in run().
-            "n": 1,
-        }
-        if seed > 0:
-            payload["seed"] = seed
-        return payload
-
-    def _resolve_ratio(self, ratio_input: str, refs: List[torch.Tensor]) -> str:
-        ratio = _normalize_openai_aspect_ratio_label(ratio_input)
-        if ratio == "自动" and refs:
-            best = _choose_best_aspect_ratio_from_options(refs[0], OPENAI_IMAGE_ASPECT_RATIO_OPTIONS)
-            if best:
-                _log(f"OpenAI auto ratio from reference image: {best}")
-                return best
-        if ratio == "自动":
-            return "1:1"
-        return ratio
-
-    def _collect_stream_image_urls(self, response: requests.Response) -> Tuple[List[str], Dict[str, Any]]:
-        urls: List[str] = []
-        seen: set[str] = set()
-        events: List[str] = []
-        texts: List[str] = []
-        last_error = ""
-        base_url = OPENAI_API_ROOT.rstrip("/")
-
-        for raw in response.iter_lines(decode_unicode=True):
-            if not raw:
-                continue
-            line = (raw or "").strip()
-            if not line.startswith("data:"):
-                continue
-            data_str = line[5:].strip()
-            if not data_str:
-                continue
-            if data_str == "[DONE]":
-                break
-            events.append(data_str)
-            try:
-                chunk = json.loads(data_str)
-            except Exception:
-                chunk = {}
-            if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict):
-                err_obj = chunk.get("error", {})
-                last_error = str(err_obj.get("message", "")) or json.dumps(err_obj, ensure_ascii=False)
-                continue
-            content = ""
-            if isinstance(chunk, dict):
-                choices = chunk.get("choices")
-                if isinstance(choices, list) and choices:
-                    delta = choices[0].get("delta", {})
-                    if isinstance(delta, dict):
-                        val = delta.get("content", "")
-                        if isinstance(val, str):
-                            content = val
-            if content:
-                texts.append(content)
-                for u in _extract_urls_from_text(content, base_url):
-                    if u in seen:
-                        continue
-                    seen.add(u)
-                    urls.append(u)
-
-        body: Dict[str, Any] = {"stream_events": events, "stream_text": "\n".join(texts)}
-        if last_error:
-            body["stream_error"] = last_error
-        return urls, body
-
-    def _try_chat_completions_image(
-        self,
-        prompt: str,
-        model_name: str,
-        ratio_value: str,
-        refs: List[torch.Tensor],
-        image_count: int,
-        seed: int,
-        api_key: str,
-    ) -> Tuple[List[torch.Tensor], Dict[str, Any], Optional[str]]:
-        headers = {
-            "Authorization": f"Bearer {(api_key or '').strip()}",
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
-        payload = self._build_chat_payload(
-            prompt=prompt,
-            model_name=model_name,
-            ratio_value=ratio_value,
-            refs=refs,
-            image_count=image_count,
-            seed=seed,
-        )
-
-        mode = "图生图" if refs else "文生图"
-        _log(
-            f"OpenAI {mode} route: /v1/chat/completions(stream), "
-            f"model={model_name}, refs={len(refs)}, n={image_count}"
-        )
-        try:
-            response = requests.post(
-                CHAT_COMPLETIONS_URL,
-                headers=headers,
-                json=payload,
-                stream=True,
-                timeout=(30, 300),
-            )
-        except Exception as exc:
-            return [], {"exception": str(exc)}, f"chat request exception: {exc}"
-
-        if response.status_code not in (200, 201, 202):
-            err = (response.text or "")[:800]
-            return [], {"http_status": response.status_code, "body": err}, f"chat HTTP {response.status_code}: {err}"
-
-        urls, body = self._collect_stream_image_urls(response)
-        if not urls:
-            err = body.get("stream_error") or "chat stream no image url found"
-            return [], body, err
-
-        images: List[torch.Tensor] = []
-        for u in urls:
-            raw = _download_openai_url_bytes(u, api_key)
-            if not raw:
-                continue
-            try:
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
-                images.append(_pil_to_tensor(img))
-            except Exception:
-                continue
-            if len(images) >= image_count:
-                break
-
-        if images:
-            body["image_urls"] = urls
-            return images, body, None
-        return [], body, "image urls found but download failed"
-
-    def run(self, **kwargs):
-        prompt = kwargs.get("提示词", "")
-        model_preset = kwargs.get("模型预设", kwargs.get("model_preset", "GPT-Image2-2k"))
-        api_key = kwargs.get("API密钥", "")
-        aspect_ratio = kwargs.get("比例", kwargs.get("aspect_ratio", "自动"))
-        image_count = int(kwargs.get("输出数量", kwargs.get("n", 1)))
-        seed = int(kwargs.get("种子", 0))
-        input_images = [kwargs.get(f"参考图{i}") for i in range(1, 9)]
-
-        if not (api_key or "").strip():
-            return self._blank_result("API密钥为空，请填写后再试")
-
-        refs = [img for img in input_images if isinstance(img, torch.Tensor)]
-        mode = "图生图" if refs else "文生图"
-        ratio_value = self._resolve_ratio(aspect_ratio, refs)
-
-        model_base = (model_preset or "").strip()
-        model_name = model_base
-        image_count = max(1, min(4, image_count))
-
-        # 按模型白名单约束比例（和 server.js 保持一致），不支持就就近回退
-        ratio_value, _ratio_warn = _kr_constrain_ratio_for_model(model_name, ratio_value)
-
-        _log(
-            f"OpenAI async doc route: /v1/chat/completions, mode={mode}, "
-            f"model={model_name}, ratio={ratio_value}, refs={len(refs)}, n={image_count}"
-        )
-        try:
-            all_images: List[torch.Tensor] = []
-            last_error = ""
-            ratio_colon = ratio_value if ratio_value not in {"自动", "auto", "Auto"} else "1:1"
-
-            for idx in range(image_count):
-                req_seed = (seed + idx) if seed > 0 else 0
-                if refs:
-                    content: Any = [{"type": "image_url", "image_url": {"url": self._prepare_chat_image_data_url(ref)}} for ref in refs]
-                    content.append({"type": "text", "text": (prompt or "").strip() or "请根据参考图生成图像"})
-                else:
-                    content = (prompt or "").strip() or "请生成图像"
-
-                submit_payload: Dict[str, Any] = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": content}],
-                    "extra_body": {
-                        "google": {
-                            "image_config": {
-                                "aspect_ratio": ratio_colon,
-                            }
-                        }
-                    },
-                    "aspect_ratio": ratio_colon,
-                }
-                if req_seed > 0:
-                    submit_payload["seed"] = req_seed
-
-                submit = requests.post(
-                    CHAT_COMPLETIONS_URL,
-                    headers=_make_headers(api_key),
-                    json=submit_payload,
-                    # connect=120s 给跨境 TLS + 上行大 body 留足余量；read=600s 等 task_id
-                    timeout=(120, 600),
-                )
-                if submit.status_code not in (200, 201, 202):
-                    last_error = f"submit HTTP {submit.status_code}: {(submit.text or '')[:400]}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-                try:
-                    submit_body = submit.json()
-                except Exception:
-                    last_error = f"submit non-json: {(submit.text or '')[:300]}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-                task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
-                if not task_id and not query_url:
-                    direct_images, _ = _extract_openai_images_from_response(submit_body, api_key)
-                    if direct_images:
-                        all_images.append(direct_images[0])
-                        continue
-                    last_error = f"submit response has no task info: {json.dumps(submit_body, ensure_ascii=False)[:260]}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-                final_payload = _poll_gemini_async_task(
-                    api_key=api_key,
-                    task_id=task_id,
-                    query_url=query_url,
-                    max_attempts=200,
-                    interval_sec=3.0,
-                )
-                status = str((final_payload or {}).get("status", "")).strip().lower()
-                if status in {"failed", "error", "canceled", "cancelled"}:
-                    last_error = f"task failed: {json.dumps(final_payload, ensure_ascii=False)[:260]}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-                urls = _extract_async_image_result_urls(final_payload)
-                if not urls:
-                    last_error = f"task completed but no url: {json.dumps(final_payload, ensure_ascii=False)[:260]}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-                try:
-                    all_images.append(_download_image_to_tensor(urls[0]))
-                except Exception as exc:
-                    last_error = f"download image failed: {exc}"
-                    if idx == 0:
-                        return self._blank_result(f"OpenAI生图失败: {last_error}")
-                    _log(f"OpenAI partial batch stop {len(all_images)}/{image_count}: {last_error}")
-                    break
-
-            if all_images:
-                return (_stack_images(all_images),)
-
-            err_msg = last_error or "async image task failed"
-            return self._blank_result(f"OpenAI生图失败: {err_msg}")
-        except Exception as exc:
-            _log(f"OpenAI node exception: {exc}\n{traceback.format_exc(limit=2)}")
-            return self._blank_result(f"执行失败: {exc}")
 
 
 def _openai_image_async_worker_loop(worker_name: str) -> None:
@@ -3202,13 +3062,20 @@ class KRGPTImage2AsyncSubmitNode:
     OUTPUT_NODE = True
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         _ensure_openai_image_async_workers_started()
 
         prompt = (kwargs.get("提示词", "") or "").strip()
         aspect_ratio = (kwargs.get("比例", "自动") or "").strip()
         resolution = (kwargs.get("分辨率", "2K") or "").strip()
         quality = (kwargs.get("质量", "高") or "").strip()
-        quality_map = {"高": "high", "中等": "medium", "低": "low", "自动": "auto"}
+        quality_map = {
+            "标准": "standard",
+            "hd": "high",
+            "高": "high",
+            "中等": "medium",
+            "低": "low",
+        }
         quality_value = quality_map.get(quality, "high")
         output_format = (kwargs.get("输出格式", "png") or "").strip()
         seed = int(kwargs.get("种子", 0))
@@ -3240,7 +3107,7 @@ class KRGPTImage2AsyncSubmitNode:
         if refs:
             image_urls: List[Dict[str, str]] = []
             for ref in refs:
-                data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=90)
+                data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=100)
                 image_urls.append({"image_url": data_url})
             payload: Dict[str, Any] = {
                 "model": "gpt-image-2",
@@ -3263,12 +3130,12 @@ class KRGPTImage2AsyncSubmitNode:
             }
             path = "/v1/images/generations"
 
-        submit_url = CHAT_COMPLETIONS_URL.replace("/v1/chat/completions", path)
+        submit_url = OPENAI_API_ROOT.rstrip("/") + path
 
         _log(f"GPT-Image-2 async submit: path={path}, size={size}, refs={len(refs)}")
 
         try:
-            resp = requests.post(submit_url, headers=_make_headers(api_key), json=payload, timeout=(120, 600))
+            resp = _http_post(submit_url, headers=_make_headers(api_key), json=payload, timeout=(120, 600))
         except Exception as exc:
             return (f"提交失败: {exc}",)
 
@@ -3281,11 +3148,9 @@ class KRGPTImage2AsyncSubmitNode:
             return (f"提交失败: non-json response",)
 
         # 提取 task_id
-        upstream_task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
+        upstream_task_id, query_url = _extract_native_image_task_info(submit_body)
         if not upstream_task_id and not query_url:
-            upstream_task_id = str(submit_body.get("task_id") or submit_body.get("id") or "").strip()
-            if upstream_task_id and not query_url:
-                query_url = f"{OPENAI_API_ROOT.rstrip('/')}/task/{upstream_task_id}"
+            upstream_task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
 
         local_task_id = str(uuid.uuid4())
         task_entry: Dict[str, Any] = {
@@ -3298,6 +3163,7 @@ class KRGPTImage2AsyncSubmitNode:
             "result_format": "unknown",
             "error": "",
             "created_at": time.time(),
+            "bypass_proxy": bool(kwargs.get("绕过代理", True)),
         }
 
         # 可能直接返回了图片
@@ -3343,6 +3209,7 @@ class KRGPTImage2AsyncFetchNode:
         return {
             "required": {
                 "最多等待秒数": ("INT", {"default": 300, "min": 1, "max": 1800}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -3352,6 +3219,7 @@ class KRGPTImage2AsyncFetchNode:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         max_wait_seconds = int(kwargs.get("最多等待秒数", 300))
         with OPENAI_IMAGE_ASYNC_QUEUE_LOCK:
             if not OPENAI_IMAGE_ASYNC_TASK_QUEUE:
@@ -3435,7 +3303,7 @@ def _veo_submit_and_poll(api_key: str, model: str, payload: Dict[str, Any], max_
     _log(f"Veo submit: url={submit_url}, model={model}, payload_keys={list(payload.keys())}")
 
     try:
-        resp = requests.post(submit_url, headers=headers, json=payload, timeout=(120, 600))
+        resp = _http_post(submit_url, headers=headers, json=payload, timeout=(120, 600))
     except Exception as exc:
         return None, f"submit exception: {exc}"
 
@@ -3475,7 +3343,7 @@ def _veo_submit_and_poll(api_key: str, model: str, payload: Dict[str, Any], max_
     for attempt in range(1, max_poll + 1):
         time.sleep(interval)
         try:
-            poll_resp = requests.get(
+            poll_resp = _http_get(
                 query_url,
                 headers={"Authorization": f"Bearer {(api_key or '').strip()}"},
                 params={"model": model},
@@ -3521,7 +3389,7 @@ def _veo_download_video(video_url: str, api_key: str) -> Optional[str]:
         os.makedirs(tmp_dir, exist_ok=True)
         file_path = os.path.join(tmp_dir, f"veo_{int(time.time() * 1000)}.mp4")
         headers = {"Authorization": f"Bearer {(api_key or '').strip()}"}
-        resp = requests.get(video_url, headers=headers, stream=True, timeout=(30, 600))
+        resp = _http_get(video_url, headers=headers, stream=True, timeout=(30, 600))
         resp.raise_for_status()
         with open(file_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -3551,6 +3419,7 @@ class KRVeoImageToVideoNode:
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
                 "最大轮询次数": ("INT", {"default": 300, "min": 1, "max": 3000}),
                 "轮询间隔秒": ("INT", {"default": 15, "min": 1, "max": 60}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             },
             "optional": optional_images,
         }
@@ -3561,6 +3430,7 @@ class KRVeoImageToVideoNode:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = (kwargs.get("提示词", "") or "").strip()
         model = (kwargs.get("模型", "veo3.1-fast") or "").strip()
         mode = (kwargs.get("模式", "文生视频") or "").strip()
@@ -3580,7 +3450,7 @@ class KRVeoImageToVideoNode:
             img = kwargs.get(f"参考图{i}")
             if not isinstance(img, torch.Tensor):
                 continue
-            ref_data_urls.append(_tensor_to_compressed_jpeg_data_url(img, max_long_side=1920, quality=90))
+            ref_data_urls.append(_tensor_to_compressed_jpeg_data_url(img, max_long_side=1920, quality=100))
 
         # 构造 payload
         payload: Dict[str, Any] = {
@@ -3647,6 +3517,7 @@ class KRVeoKeyframeVideoNode:
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
                 "最大轮询次数": ("INT", {"default": 300, "min": 1, "max": 3000}),
                 "轮询间隔秒": ("INT", {"default": 15, "min": 1, "max": 60}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "首帧图": ("IMAGE",),
@@ -3660,6 +3531,7 @@ class KRVeoKeyframeVideoNode:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = (kwargs.get("提示词", "") or "").strip()
         model = (kwargs.get("模型", "veo3.1-fast") or "").strip()
         aspect_ratio = (kwargs.get("比例", "16:9") or "").strip()
@@ -3689,10 +3561,10 @@ class KRVeoKeyframeVideoNode:
         if seed > 0:
             payload["seed"] = seed
 
-        payload["firstFrameBase64"] = _tensor_to_compressed_jpeg_data_url(first_frame, max_long_side=1920, quality=90)
+        payload["firstFrameBase64"] = _tensor_to_compressed_jpeg_data_url(first_frame, max_long_side=1920, quality=100)
 
         if isinstance(last_frame, torch.Tensor):
-            payload["lastFrameBase64"] = _tensor_to_compressed_jpeg_data_url(last_frame, max_long_side=1920, quality=90)
+            payload["lastFrameBase64"] = _tensor_to_compressed_jpeg_data_url(last_frame, max_long_side=1920, quality=100)
 
         _log(f"Veo keyframe request: model={model}, ratio={aspect_ratio}, res={resolution}, has_last={'yes' if isinstance(last_frame, torch.Tensor) else 'no'}")
 
@@ -3712,6 +3584,205 @@ class KRVeoKeyframeVideoNode:
             video_output = KRVideoAdapter(file_path)
 
         return (video_output, f"成功: {video_url}")
+
+
+class KRVeoI2VGenerateNode:
+    """Veo 图生视频节点（按 API-Reference 1.5）.
+
+    - 提交: POST https://ai.krapi.cn/v1/generate
+    - 轮询: GET  https://ai.krapi.cn/v1/tasks/{id}
+    - 下载: 优先 tasks/{id}/file，其次使用任务结果中的 url/video_url/file_url
+    """
+
+    DEFAULT_MODEL = "veo_3_1_i2v_fast_landscape"
+    API_BASE = "https://ai.krapi.cn"
+    ASPECT_RATIO_OPTIONS = [
+        "16:9",
+        "9:16",
+    ]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "提示词": ("STRING", {"multiline": True, "default": ""}),
+                "模型": ("STRING", {"multiline": False, "default": cls.DEFAULT_MODEL}),
+                "比例": (cls.ASPECT_RATIO_OPTIONS, {"default": "16:9"}),
+                "API密钥": ("STRING", {"multiline": False, "default": ""}),
+                "最大轮询次数": ("INT", {"default": 180, "min": 1, "max": 3000}),
+                "轮询间隔秒": ("INT", {"default": 5, "min": 1, "max": 60}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "参考图1": ("IMAGE",),
+                "参考图2": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = (IO.VIDEO, "STRING")
+    RETURN_NAMES = ("视频", "信息")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY_NAME
+
+    def _apply_ratio_to_model(self, model_name: str, aspect_ratio: str) -> str:
+        model = (model_name or "").strip()
+        target = "portrait" if aspect_ratio == "9:16" else "landscape"
+
+        if "_landscape" in model:
+            return model.replace("_landscape", f"_{target}")
+        if "_portrait" in model:
+            return model.replace("_portrait", f"_{target}")
+
+        for suffix in ("_1080p", "_4k"):
+            if model.endswith(suffix):
+                return f"{model[:-len(suffix)]}_{target}{suffix}"
+
+        return f"{model}_{target}" if model else model
+
+    def _extract_task_id(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("task_id", "taskId", "id"):
+            val = payload.get(key)
+            if isinstance(val, (str, int)) and str(val).strip():
+                return str(val).strip()
+        data_obj = payload.get("data")
+        if isinstance(data_obj, dict):
+            for key in ("task_id", "taskId", "id"):
+                val = data_obj.get(key)
+                if isinstance(val, (str, int)) and str(val).strip():
+                    return str(val).strip()
+        return ""
+
+    def _extract_video_url(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("video_url", "url", "file_url"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.startswith(("http://", "https://")):
+                return val
+        result = payload.get("result")
+        if isinstance(result, dict):
+            for key in ("video_url", "url", "file_url"):
+                val = result.get(key)
+                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                    return val
+        data_obj = payload.get("data")
+        if isinstance(data_obj, dict):
+            for key in ("video_url", "url", "file_url"):
+                val = data_obj.get(key)
+                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                    return val
+        return ""
+
+    def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
+        prompt = str(kwargs.get("提示词", "") or "").strip()
+        model_name = str(kwargs.get("模型", self.DEFAULT_MODEL) or self.DEFAULT_MODEL).strip()
+        aspect_ratio = str(kwargs.get("比例", "16:9") or "16:9").strip()
+        api_key = str(kwargs.get("API密钥", "") or "").strip()
+        max_polls = int(kwargs.get("最大轮询次数", 180))
+        interval_sec = int(kwargs.get("轮询间隔秒", 5))
+        image_1 = kwargs.get("参考图1")
+        image_2 = kwargs.get("参考图2")
+
+        if not api_key:
+            return (KRVideoAdapter(""), "API密钥为空")
+        if not isinstance(image_1, torch.Tensor):
+            return (KRVideoAdapter(""), "图生视频至少需要 参考图1")
+        if aspect_ratio not in {"16:9", "9:16"}:
+            aspect_ratio = "16:9"
+
+        effective_model = self._apply_ratio_to_model(model_name, aspect_ratio)
+
+        content_parts: List[Dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": _tensor_to_compressed_jpeg_data_url(image_1, max_long_side=1920, quality=100)}}
+        ]
+        if isinstance(image_2, torch.Tensor):
+            content_parts.append({"type": "image_url", "image_url": {"url": _tensor_to_compressed_jpeg_data_url(image_2, max_long_side=1920, quality=100)}})
+        content_parts.append({"type": "text", "text": prompt or "Make a smooth cinematic motion."})
+
+        submit_payload: Dict[str, Any] = {
+            "model": effective_model,
+            "messages": [{"role": "user", "content": content_parts}],
+        }
+
+        submit_url = f"{self.API_BASE.rstrip('/')}/v1/generate"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "X-API-Key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        _log(
+            f"Veo(generate) submit: model_input={model_name}, model_final={effective_model}, "
+            f"refs={2 if isinstance(image_2, torch.Tensor) else 1}, ratio={aspect_ratio}, url={submit_url}"
+        )
+
+        try:
+            submit_resp = _http_post(submit_url, headers=headers, json=submit_payload, timeout=(120, 600))
+        except Exception as exc:
+            return (KRVideoAdapter(""), f"提交异常: {exc}")
+
+        if submit_resp.status_code not in (200, 201, 202):
+            return (KRVideoAdapter(""), f"提交失败: HTTP {submit_resp.status_code} - {(submit_resp.text or '')[:400]}")
+
+        try:
+            submit_body = submit_resp.json()
+        except Exception:
+            return (KRVideoAdapter(""), f"提交失败: 非JSON响应 - {(submit_resp.text or '')[:300]}")
+
+        task_id = self._extract_task_id(submit_body)
+        if not task_id:
+            direct_url = self._extract_video_url(submit_body)
+            if direct_url:
+                file_path = _download_video_to_temp(direct_url, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
+                if file_path:
+                    return ((VideoFromFile(file_path) if VideoFromFile is not None else KRVideoAdapter(file_path)), f"成功: {direct_url}")
+            return (KRVideoAdapter(""), f"提交成功但无task_id: {json.dumps(submit_body, ensure_ascii=False)[:400]}")
+
+        query_url = f"{self.API_BASE.rstrip('/')}/v1/tasks/{task_id}"
+        last_payload: Dict[str, Any] = {}
+        for attempt in range(1, max_polls + 1):
+            time.sleep(interval_sec)
+            try:
+                poll_resp = _http_get(query_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=(20, 120))
+            except Exception as exc:
+                _log(f"Veo(generate) poll exception: attempt={attempt}, error={exc}")
+                continue
+
+            if poll_resp.status_code != 200:
+                _log(f"Veo(generate) poll failed: attempt={attempt}, http={poll_resp.status_code}, body={(poll_resp.text or '')[:220]}")
+                continue
+
+            try:
+                body = poll_resp.json()
+            except Exception:
+                body = {"raw": (poll_resp.text or "")[:500]}
+
+            if isinstance(body, dict):
+                last_payload = body
+            status = str((body or {}).get("status", "")).strip().lower()
+            _log(f"Veo(generate) poll: attempt={attempt}, status={status or 'unknown'}")
+
+            if status in {"failed", "error", "canceled", "cancelled"}:
+                return (KRVideoAdapter(""), f"任务失败: {json.dumps(body, ensure_ascii=False)[:400]}")
+
+            if status in {"completed", "done", "success", "succeeded"}:
+                # 优先官方下载路由
+                file_endpoint = f"{self.API_BASE.rstrip('/')}/v1/tasks/{task_id}/file"
+                local_path = _download_video_to_temp(file_endpoint, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
+                if not local_path:
+                    video_url = self._extract_video_url(body)
+                    if video_url:
+                        local_path = _download_video_to_temp(video_url, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
+                if not local_path:
+                    return (KRVideoAdapter(""), f"任务完成但下载失败: {json.dumps(body, ensure_ascii=False)[:400]}")
+                video_output = VideoFromFile(local_path) if VideoFromFile is not None else KRVideoAdapter(local_path)
+                return (video_output, f"成功: task={task_id}")
+
+        return (KRVideoAdapter(""), f"轮询超时: task={task_id}, last={json.dumps(last_payload, ensure_ascii=False)[:400]}")
 
 
 # ================================
@@ -3749,10 +3820,12 @@ GPT_IMAGE2_RESOLUTION_OPTIONS = [
 ]
 
 GPT_IMAGE2_QUALITY_OPTIONS = [
+    "标准",
+    "高",
+    "hd",
     "高",
     "中等",
     "低",
-    "自动",
 ]
 
 GPT_IMAGE2_FORMAT_OPTIONS = [
@@ -3836,7 +3909,7 @@ def _gpt_image2_resolve_size(aspect_ratio: str, resolution: str) -> str:
 class KRGPTImage2Node:
     """GPT-Image-2 生图节点。
     走 /v1/images/generations(文生图）或 /v1/images/edits（图生图）。
-    通过 server.js 伪异步：提交 → task_id → 轮询 /task/{id} 拿结果。
+    原生异步：提交 → task_id → 轮询 /v1/images/tasks/{id} 拿结果。
     """
 
     @classmethod
@@ -3852,6 +3925,7 @@ class KRGPTImage2Node:
                 "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
                 "最大等待秒数": ("INT", {"default": 600, "min": 30, "max": 3600}),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
+                "绕过代理": ("BOOLEAN", {"default": True}),
             },
             "optional": optional_images,
         }
@@ -3862,11 +3936,18 @@ class KRGPTImage2Node:
     CATEGORY = CATEGORY_NAME
 
     def run(self, **kwargs):
+        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = (kwargs.get("提示词", "") or "").strip()
         aspect_ratio = (kwargs.get("比例", "自动") or "").strip()
         resolution = (kwargs.get("分辨率", "2K") or "").strip()
         quality = (kwargs.get("质量", "高") or "").strip()
-        quality_map = {"高": "high", "中等": "medium", "低": "low", "自动": "auto"}
+        quality_map = {
+            "标准": "standard",
+            "hd": "high",
+            "高": "high",
+            "中等": "medium",
+            "低": "low",
+        }
         quality_value = quality_map.get(quality, "high")
         output_format = (kwargs.get("输出格式", "png") or "").strip()
         seed = int(kwargs.get("种子", 0))
@@ -3918,7 +3999,7 @@ class KRGPTImage2Node:
 
         _log(f"GPT-Image-2 generations: size={size}, quality={quality}, format={output_format}")
 
-        # 走 server.js 伪异步
+        # 走原生异步图片任务
         result = self._submit_and_poll(
             path="/v1/images/generations",
             payload=payload,
@@ -3932,7 +4013,7 @@ class KRGPTImage2Node:
         # 把参考图编码成 data URL
         image_urls: List[Dict[str, str]] = []
         for ref in refs:
-            data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=90)
+            data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=100)
             image_urls.append({"image_url": data_url})
 
         payload: Dict[str, Any] = {
@@ -3947,7 +4028,7 @@ class KRGPTImage2Node:
 
         _log(f"GPT-Image-2 edits: size={size}, quality={quality}, format={output_format}, refs={len(refs)}")
 
-        # 走 server.js 伪异步
+        # 走原生异步图片任务
         result = self._submit_and_poll(
             path="/v1/images/edits",
             payload=payload,
@@ -3957,13 +4038,13 @@ class KRGPTImage2Node:
         return result
 
     def _submit_and_poll(self, path: str, payload: Dict[str, Any], api_key: str, max_wait: int = 600):
-        """提交到 server.js 伪异步通道,轮询拿结果。"""
-        submit_url = CHAT_COMPLETIONS_URL.replace("/v1/chat/completions", path)
+        """提交到原生图片异步通道,轮询拿结果。"""
+        submit_url = OPENAI_API_ROOT.rstrip("/") + path
 
         headers = _make_headers(api_key)
 
         try:
-            resp = requests.post(submit_url, headers=headers, json=payload, timeout=(120, 600))
+            resp = _http_post(submit_url, headers=headers, json=payload, timeout=(120, 600))
         except Exception as exc:
             _log(f"GPT-Image-2 submit exception: {exc}")
             return (_blank_image(1024),)
@@ -3980,7 +4061,7 @@ class KRGPTImage2Node:
             _log(f"GPT-Image-2 submit non-json: {resp.text[:300]}")
             return (_blank_image(1024),)
 
-        # 1) 可能直接返回了图片（同步模式,不经过 server.js）
+        # 1) 兼容极少数直接返回图片的上游。
         if isinstance(submit_body, dict) and submit_body.get("data"):
             data_list = submit_body.get("data", [])
             if isinstance(data_list, list) and data_list:
@@ -4002,14 +4083,10 @@ class KRGPTImage2Node:
                     except Exception as exc:
                         _log(f"GPT-Image-2: download direct url failed: {exc}")
 
-        # 2) server.js 伪异步壳：从 choices[0].message.content 里抠 task_id
-        task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
+        # 2) 原生图片异步任务：顶层 id/task_id。
+        task_id, query_url = _extract_native_image_task_info(submit_body)
         if not task_id and not query_url:
-            # 尝试从顶层字段读
-            task_id = str(submit_body.get("task_id") or submit_body.get("id") or "").strip()
-            query_url = str(submit_body.get("query_url") or "").strip()
-            if task_id and not query_url:
-                query_url = f"{OPENAI_API_ROOT.rstrip('/')}/task/{task_id}"
+            task_id, query_url = _extract_async_task_info_from_chat_response(submit_body)
 
         if not task_id and not query_url:
             _log(f"GPT-Image-2: no task_id in response: {json.dumps(submit_body, ensure_ascii=False)[:400]}")
@@ -4032,28 +4109,28 @@ class KRGPTImage2Node:
 
 NODE_CLASS_MAPPINGS = {
     "KRLLMNode": KRLLMNode,
+    "KRGPTLanguageNode": KRGPTLanguageNode,
     "KRGeminiImageNode": KRGeminiImageNode,
     "KRGeminiImageAsyncSubmitNode": KRGeminiImageAsyncSubmitNode,
     "KRGeminiImageAsyncFetchNode": KRGeminiImageAsyncFetchNode,
-    "KROpenAIImageNode": KROpenAIImageNode,
     "KROpenAIImageAsyncSubmitNode": KRGPTImage2AsyncSubmitNode,
     "KROpenAIImageAsyncFetchNode": KRGPTImage2AsyncFetchNode,
     "KRGPTImage2Node": KRGPTImage2Node,
     "KRVeoImageToVideoNode": KRVeoImageToVideoNode,
     "KRVeoKeyframeVideoNode": KRVeoKeyframeVideoNode,
+    "KRVeoI2VGenerateNode": KRVeoI2VGenerateNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KRLLMNode": "KR-\u8bed\u8a00\u5927\u6a21\u578b",
+    "KRGPTLanguageNode": "KR-GPT\u8bed\u8a00\u6a21\u578b",
     "KRGeminiImageNode": "KR-Gemini\u751f\u56fe",
     "KRGeminiImageAsyncSubmitNode": "KR-Gemini异步提交",
     "KRGeminiImageAsyncFetchNode": "KR-Gemini异步获取",
-    "KROpenAIImageNode": "KR-OpenAI\u751f\u56fe",
     "KROpenAIImageAsyncSubmitNode": "KR-GPT-Image-2异步提交",
     "KROpenAIImageAsyncFetchNode": "KR-GPT-Image-2异步获取",
     "KRGPTImage2Node": "KR-GPT-Image-2\u751f\u56fe",
     "KRVeoImageToVideoNode": "KR-Veo图生视频",
     "KRVeoKeyframeVideoNode": "KR-Veo首尾帧视频",
+    "KRVeoI2VGenerateNode": "KR-Veo图生视频(Generate)",
 }
-
-
