@@ -72,8 +72,6 @@ OPENAI_IMAGE_GENERATIONS_URL = f"{OPENAI_API_V1}/images/generations"
 OPENAI_IMAGE_EDITS_URL = f"{OPENAI_API_V1}/images/edits"
 VEO_VIDEO_CREATE_URL = OPENAI_API_ROOT.rstrip("/") + "/v1/videos"
 VEO_VIDEO_QUERY_URL = OPENAI_API_ROOT.rstrip("/") + "/v1/videos"
-VEO_VIDEO_LEGACY_CREATE_URL = OPENAI_API_ROOT.rstrip("/") + "/v1/video/create"
-VEO_VIDEO_LEGACY_QUERY_URL = OPENAI_API_ROOT.rstrip("/") + "/v1/video/query"
 GROK_API_ROOT = "https://ai.krapi.cn/"
 GROK_API_V1 = GROK_API_ROOT.rstrip("/") + "/v1"
 GROK_VIDEO_CREATE_URL = GROK_API_V1 + "/videos"
@@ -248,8 +246,14 @@ def _kr_constrain_ratio_for_model(model_name: str, ratio: str) -> Tuple[str, Opt
     return fallback, msg
 
 VEO_MODEL_PRESETS = [
-    "veo3.1-4k",
-    "veo3.1-pro-4k",
+    "veo_3_1_i2v_fast_landscape",
+    "veo_3_1_i2v_fast_portrait",
+    "veo_3_1_i2v_fast_landscape_1080p",
+    "veo_3_1_i2v_fast_portrait_4k",
+    "veo_3_1_i2v_s_landscape",
+    "veo_3_1_i2v_s_landscape_1080p",
+    "veo_3_1_i2v_s_portrait_4k",
+    "veo_3_1_i2v_lite_portrait",
 ]
 
 GROK_VIDEO_MODEL_PRESETS = [
@@ -293,11 +297,6 @@ VEO_DURATION_OPTIONS = [
     "4秒",
     "6秒",
     "8秒",
-]
-
-VEO_SEED_MODE_OPTIONS = [
-    "固定",
-    "自动随机",
 ]
 
 GEMINI_ASYNC_SUBMISSION_QUEUE: List[Dict[str, Any]] = []
@@ -426,6 +425,12 @@ def _make_headers(api_key: str) -> Dict[str, str]:
         "X-API-Key": key,
         "X-Banana-Client": "comfyui-kr-api",
     }
+
+
+def _make_multipart_headers(api_key: str) -> Dict[str, str]:
+    headers = _make_headers(api_key)
+    headers.pop("Content-Type", None)
+    return headers
 
 
 def _make_openai_compat_headers(api_key: str) -> Dict[str, str]:
@@ -773,6 +778,22 @@ def _tensor_to_compressed_jpeg_data_url(image_tensor: torch.Tensor, max_long_sid
     image.save(buf, format="JPEG", quality=quality)
     encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{encoded}"
+
+
+def _tensor_to_compressed_jpeg_bytes(image_tensor: torch.Tensor, max_long_side: int = 2048, quality: int = 100) -> bytes:
+    frame = image_tensor[0:1] if image_tensor.dim() == 4 else image_tensor.unsqueeze(0)
+    image = _tensor_to_pil(frame).convert("RGB")
+    w, h = image.size
+    long_side = max(w, h)
+    if long_side > max_long_side and long_side > 0:
+        scale = float(max_long_side) / float(long_side)
+        new_w = max(16, int(round(w * scale)))
+        new_h = max(16, int(round(h * scale)))
+        resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        image = image.resize((new_w, new_h), resampling)
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 def _extract_text_from_content(content: Any) -> str:
@@ -1269,6 +1290,8 @@ def _create_reference_gemini_request(
     image_size: str,
     input_images_b64: List[str],
     include_image_size: bool = True,
+    add_prompt_config_suffix: bool = True,
+    include_top_p: bool = True,
 ) -> Dict[str, Any]:
     prompt_text = (prompt or "").strip()
     if not prompt_text and not input_images_b64:
@@ -1279,17 +1302,18 @@ def _create_reference_gemini_request(
     if not prompt_text:
         prompt_text = "请根据参考图生成图像"
 
-    suffix_parts: List[str] = []
-    normalized_size = (image_size or "").strip().upper()
-    if include_image_size and normalized_size in {"1K", "2K", "4K"}:
-        suffix_parts.append(f"\u5206\u8fa8\u7387: {normalized_size}")
-
     normalized_ratio = (aspect_ratio or "").strip()
-    if normalized_ratio and normalized_ratio.lower() != "auto":
-        suffix_parts.append(f"\u6bd4\u4f8b: {normalized_ratio}")
+    normalized_size = (image_size or "").strip().upper()
+    if add_prompt_config_suffix:
+        suffix_parts: List[str] = []
+        if include_image_size and normalized_size in {"1K", "2K", "4K"}:
+            suffix_parts.append(f"\u5206\u8fa8\u7387: {normalized_size}")
 
-    if prompt_text and suffix_parts:
-        prompt_text = prompt_text + " [" + ", ".join(suffix_parts) + "]"
+        if normalized_ratio and normalized_ratio.lower() != "auto":
+            suffix_parts.append(f"\u6bd4\u4f8b: {normalized_ratio}")
+
+        if prompt_text and suffix_parts:
+            prompt_text = prompt_text + " [" + ", ".join(suffix_parts) + "]"
 
     parts: List[Dict[str, Any]] = []
     if prompt_text:
@@ -1308,9 +1332,10 @@ def _create_reference_gemini_request(
         )
 
     generation_config: Dict[str, Any] = {
-        "topP": 0.95,
         "responseModalities": ["IMAGE"],
     }
+    if include_top_p:
+        generation_config["topP"] = 0.95
     if isinstance(seed, int) and seed >= 0:
         generation_config["seed"] = seed
 
@@ -2330,8 +2355,7 @@ class KRGeminiImageNode:
         if size_for_api not in {"1K", "2K", "4K"}:
             size_for_api = "2K"
 
-        seed_int = int(seed)
-        seed_for_api = seed_int % 2147483647 if seed_int > 0 else -1
+        seed_for_api = -1
 
         input_images_b64: List[str] = []
         ref_count = 0
@@ -2359,6 +2383,8 @@ class KRGeminiImageNode:
             image_size=size_for_api,
             input_images_b64=input_images_b64,
             include_image_size=include_image_size,
+            add_prompt_config_suffix=False,
+            include_top_p=False,
         )
 
         _log(
@@ -2698,16 +2724,38 @@ def _poll_openai_task_result(api_key: str, task_id: str, max_attempts: int = 90,
 
 
 def _extract_video_url_from_payload(payload: Any) -> Optional[str]:
-    def _is_http_url(value: Any) -> bool:
+    def _normalize_video_url(value: Any) -> Optional[str]:
         if not isinstance(value, str):
+            return None
+        text = value.strip().strip("\"'")
+        if not text:
+            return None
+        text = text.replace("\\/", "/")
+        text = re.sub(r"^https?://\s+", "https://", text, flags=re.IGNORECASE)
+        text = re.sub(r"^https?://%20", "https://", text, flags=re.IGNORECASE)
+        text = text.replace("https:// ai.krapi.cn", "https://ai.krapi.cn")
+        text = text.replace("http:// ai.krapi.cn", "https://ai.krapi.cn")
+        text = text.replace("https://%20ai.krapi.cn", "https://ai.krapi.cn")
+        text = text.replace("http://%20ai.krapi.cn", "https://ai.krapi.cn")
+        if text.startswith("/"):
+            return VEO_API_BASE.rstrip("/") + text
+        if text.startswith("ai.krapi.cn/"):
+            return "https://" + text
+        if text.startswith("http://ai.krapi.cn/"):
+            return "https://" + text[len("http://"):]
+        return text
+
+    def _is_http_url(value: Any) -> bool:
+        text = _normalize_video_url(value)
+        if not text:
             return False
-        text = value.strip()
         return text.startswith(("http://", "https://"))
 
     def _is_video_url(value: Any) -> bool:
-        if not isinstance(value, str):
+        text = _normalize_video_url(value)
+        if not text:
             return False
-        text = value.strip().lower()
+        text = text.lower()
         return text.startswith(("http://", "https://")) and any(
             ext in text for ext in (".mp4", ".mov", ".webm", ".m3u8")
         )
@@ -2724,20 +2772,20 @@ def _extract_video_url_from_payload(payload: Any) -> Optional[str]:
         for key in ("video_url", "videoUrl", "output", "video", "url", "download_url"):
             value = payload.get(key)
             if _is_http_url(value):
-                return value.strip()
+                return _normalize_video_url(value)
 
         data = payload.get("data")
         if isinstance(data, dict):
             for key in ("video_url", "videoUrl", "output", "video", "url", "download_url"):
                 value = data.get(key)
                 if _is_http_url(value):
-                    return value.strip()
+                    return _normalize_video_url(value)
             nested_output = data.get("output")
             if isinstance(nested_output, dict):
                 for key in ("video_url", "url"):
                     value = nested_output.get(key)
                     if _is_http_url(value):
-                        return value.strip()
+                        return _normalize_video_url(value)
 
     candidates: List[str] = []
     url_like_candidates: List[str] = []
@@ -2747,7 +2795,7 @@ def _extract_video_url_from_payload(payload: Any) -> Optional[str]:
             for key, value in node.items():
                 key_l = str(key).strip().lower()
                 if isinstance(value, str):
-                    text = value.strip()
+                    text = _normalize_video_url(value) or ""
                     if _is_video_url(text):
                         candidates.append(text)
                     elif text.startswith(("http://", "https://")) and any(
@@ -2767,7 +2815,7 @@ def _extract_video_url_from_payload(payload: Any) -> Optional[str]:
             for item in node:
                 _walk(item, parent_key)
         elif isinstance(node, str):
-            text = node.strip()
+            text = _normalize_video_url(node) or ""
             if _is_video_url(text):
                 candidates.append(text)
             elif text.startswith(("http://", "https://")) and any(
@@ -2836,23 +2884,12 @@ def _extract_veo_status(payload: Any) -> str:
 def _poll_veo_video_task(api_key: str, task_id: str, max_attempts: int = 300, interval_sec: float = 2.0) -> Dict[str, Any]:
     last_payload: Dict[str, Any] = {}
     for attempt in range(1, max_attempts + 1):
-        response = None
-        query_targets = [
-            (f"{VEO_VIDEO_QUERY_URL}/{task_id}", None),
-            (VEO_VIDEO_LEGACY_QUERY_URL, {"id": task_id}),
-            (VEO_VIDEO_LEGACY_QUERY_URL, {"task_id": task_id}),
-        ]
-        for query_url, query_params in query_targets:
-            response = _http_get(query_url, headers=_make_headers(api_key), params=query_params, timeout=(15, 120))
-            if response.status_code == 200:
-                break
+        response = _http_get(f"{VEO_VIDEO_QUERY_URL}/{task_id}", headers=_make_headers(api_key), timeout=(15, 120))
 
-        if response is None or response.status_code != 200:
-            failed_code = "no_response" if response is None else response.status_code
-            failed_body = "" if response is None else (response.text or "")[:220]
+        if response.status_code != 200:
             _log(
-                f"Veo poll failed: attempt={attempt}, http={failed_code}, "
-                f"body={failed_body}"
+                f"Veo poll failed: attempt={attempt}, http={response.status_code}, "
+                f"body={(response.text or '')[:220]}"
             )
             time.sleep(interval_sec)
             continue
@@ -3104,26 +3141,27 @@ class KRGPTImage2AsyncSubmitNode:
         size = _gpt_image2_resolve_size(aspect_ratio, resolution)
 
         # 构造 payload
+        form_data: Optional[Dict[str, str]] = None
+        files: Optional[List[Tuple[str, Tuple[str, bytes, str]]]] = None
         if refs:
-            image_urls: List[Dict[str, str]] = []
-            for ref in refs:
-                data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=100)
-                image_urls.append({"image_url": data_url})
-            payload: Dict[str, Any] = {
-                "model": "gpt-image-2",
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-                "quality": quality_value,
-                "output_format": output_format,
-                "images": image_urls,
-            }
+            form_data, files = _build_gpt_image2_edit_multipart(
+                prompt,
+                size,
+                aspect_ratio,
+                resolution,
+                quality_value,
+                output_format,
+                refs,
+            )
+            payload = None
             path = "/v1/images/edits"
         else:
             payload = {
                 "model": "gpt-image-2",
                 "prompt": prompt,
                 "size": size,
+                "ratio": aspect_ratio,
+                "image_size": resolution,
                 "n": 1,
                 "quality": quality_value,
                 "output_format": output_format,
@@ -3135,7 +3173,16 @@ class KRGPTImage2AsyncSubmitNode:
         _log(f"GPT-Image-2 async submit: path={path}, size={size}, refs={len(refs)}")
 
         try:
-            resp = _http_post(submit_url, headers=_make_headers(api_key), json=payload, timeout=(120, 600))
+            if files is not None:
+                resp = _http_post(
+                    submit_url,
+                    headers=_make_multipart_headers(api_key),
+                    data=form_data or {},
+                    files=files,
+                    timeout=(120, 600),
+                )
+            else:
+                resp = _http_post(submit_url, headers=_make_headers(api_key), json=payload, timeout=(120, 600))
         except Exception as exc:
             return (f"提交失败: {exc}",)
 
@@ -3266,41 +3313,17 @@ class KRGPTImage2AsyncFetchNode:
         return (_stack_images(images), "\n".join(reports))
 
 
-VEO_NEW_MODEL_PRESETS = [
-    "veo3.1-fast",
-    "veo3.1",
-]
-
-VEO_NEW_ASPECT_RATIO_OPTIONS = [
-    "16:9",
-    "9:16",
-]
-
-VEO_NEW_RESOLUTION_OPTIONS = [
-    "720p",
-]
-
-VEO_NEW_MODE_OPTIONS = [
-    "文生视频",
-    "图生视频",
-    "参考图生视频",
-]
-
 VEO_API_BASE = "https://ai.krapi.cn"
 
 
 def _veo_submit_and_poll(api_key: str, model: str, payload: Dict[str, Any], max_poll: int = 300, interval: float = 15.0) -> Tuple[Optional[str], str]:
-    """提交视频任务并轮询结果。
-    返回 (video_url, error_message)。
-    会把提交返回和轮询返回打印到控制台方便调试。
-    """
-    submit_url = f"{VEO_API_BASE}/v1/videos"
-    headers = {
-        "Authorization": f"Bearer {(api_key or '').strip()}",
-        "Content-Type": "application/json",
-    }
+    submit_url = f"{VEO_API_BASE.rstrip('/')}/v1/videos"
+    headers = _make_headers(api_key)
 
-    _log(f"Veo submit: url={submit_url}, model={model}, payload_keys={list(payload.keys())}")
+    _log(
+        f"Veo submit: url={submit_url}, model={model}, "
+        f"images={_count_veo_message_images(payload)}, seconds={payload.get('seconds')}"
+    )
 
     try:
         resp = _http_post(submit_url, headers=headers, json=payload, timeout=(120, 600))
@@ -3317,27 +3340,17 @@ def _veo_submit_and_poll(api_key: str, model: str, payload: Dict[str, Any], max_
     except Exception:
         return None, f"submit non-json: {(resp.text or '')[:300]}"
 
-    # 提取 task_id（上游返回字段名是 "id"）
-    task_id = ""
-    if isinstance(submit_body, dict):
-        task_id = str(
-            submit_body.get("id") or submit_body.get("task_id") or
-            submit_body.get("taskId") or ""
-        ).strip()
+    task_id = _extract_veo_task_id(submit_body) or ""
 
     if not task_id:
-        # 可能直接返回了 video_url
-        video_url = None
-        if isinstance(submit_body, dict):
-            video_url = submit_body.get("video_url") or submit_body.get("url")
+        video_url = _extract_video_url_from_payload(submit_body)
         if video_url:
             return video_url, ""
         return None, f"no task_id in submit response: {json.dumps(submit_body, ensure_ascii=False)[:400]}"
 
     _log(f"Veo task created: {task_id}, polling (interval={interval}s)...")
 
-    # 轮询（带 model 参数）
-    query_url = f"{VEO_API_BASE}/v1/videos/{task_id}"
+    query_url = f"{VEO_API_BASE.rstrip('/')}/v1/videos/{task_id}"
     last_payload: Dict[str, Any] = {}
 
     for attempt in range(1, max_poll + 1):
@@ -3364,17 +3377,17 @@ def _veo_submit_and_poll(api_key: str, model: str, payload: Dict[str, Any], max_
 
         last_payload = poll_body if isinstance(poll_body, dict) else {}
 
-        status = str(last_payload.get("status", "unknown")).lower()
-        video_url = last_payload.get("video_url") or last_payload.get("url")
+        status = str(last_payload.get("status", "unknown")).strip().lower()
+        video_url = _extract_video_url_from_payload(last_payload)
 
         _log(f"Veo poll: attempt={attempt}, status={status}, has_video_url={'yes' if video_url else 'no'}")
 
-        if status == "completed":
+        if status in {"completed", "complete", "done", "success", "succeeded"}:
             if video_url:
                 return video_url, ""
-            return None, f"task completed but no video_url: {json.dumps(last_payload, ensure_ascii=False)[:400]}"
+            return f"{query_url}/content", ""
 
-        if status == "failed":
+        if status in {"failed", "failure", "error", "cancelled", "canceled", "rejected"}:
             error = last_payload.get("error", {})
             err_msg = error.get("message", "") if isinstance(error, dict) else str(error)
             return None, f"task failed: {err_msg or json.dumps(last_payload, ensure_ascii=False)[:400]}"
@@ -3388,8 +3401,23 @@ def _veo_download_video(video_url: str, api_key: str) -> Optional[str]:
         tmp_dir = os.path.join(tempfile.gettempdir(), "comfyui_kr_api_videos")
         os.makedirs(tmp_dir, exist_ok=True)
         file_path = os.path.join(tmp_dir, f"veo_{int(time.time() * 1000)}.mp4")
-        headers = {"Authorization": f"Bearer {(api_key or '').strip()}"}
-        resp = _http_get(video_url, headers=headers, stream=True, timeout=(30, 600))
+        clean_url = (video_url or "").strip().strip("\"'")
+        clean_url = clean_url.replace("\\/", "/")
+        clean_url = re.sub(r"^https?://\s+", "https://", clean_url, flags=re.IGNORECASE)
+        clean_url = re.sub(r"^https?://%20", "https://", clean_url, flags=re.IGNORECASE)
+        clean_url = clean_url.replace("https:// ai.krapi.cn", "https://ai.krapi.cn")
+        clean_url = clean_url.replace("http:// ai.krapi.cn", "https://ai.krapi.cn")
+        clean_url = clean_url.replace("https://%20ai.krapi.cn", "https://ai.krapi.cn")
+        clean_url = clean_url.replace("http://%20ai.krapi.cn", "https://ai.krapi.cn")
+        if clean_url.startswith("/"):
+            clean_url = VEO_API_BASE.rstrip("/") + clean_url
+        elif clean_url.startswith("ai.krapi.cn/"):
+            clean_url = "https://" + clean_url
+        elif clean_url.startswith("http://ai.krapi.cn/"):
+            clean_url = "https://" + clean_url[len("http://"):]
+        url_l = clean_url.lower()
+        headers = {"Authorization": f"Bearer {(api_key or '').strip()}"} if "/v1/videos/" in url_l else {}
+        resp = _http_get(clean_url, headers=headers, stream=True, timeout=(30, 600))
         resp.raise_for_status()
         with open(file_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
@@ -3402,26 +3430,44 @@ def _veo_download_video(video_url: str, api_key: str) -> Optional[str]:
         return None
 
 
+def _count_veo_message_images(payload: Dict[str, Any]) -> int:
+    count = 0
+    for message in payload.get("messages") or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "image_url":
+                count += 1
+    return count
+
+
+def _build_veo_messages(image_urls: List[str], prompt: str) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [
+        {"type": "image_url", "image_url": {"url": url}}
+        for url in image_urls
+        if isinstance(url, str) and url.strip()
+    ]
+    content.append({"type": "text", "text": prompt})
+    return [{"role": "user", "content": content}]
+
+
 class KRVeoImageToVideoNode:
-    """Veo 图生视频节点。支持三种模式：文生视频、图生视频、参考图生视频。"""
+    """Veo 图生视频节点。"""
 
     @classmethod
     def INPUT_TYPES(cls):
-        optional_images = {f"参考图{i}": ("IMAGE",) for i in range(1, 9)}
         return {
             "required": {
                 "提示词": ("STRING", {"multiline": True, "default": ""}),
-                "模型": (VEO_NEW_MODEL_PRESETS, {"default": "veo3.1-fast"}),
-                "模式": (VEO_NEW_MODE_OPTIONS, {"default": "文生视频"}),
-                "比例": (VEO_NEW_ASPECT_RATIO_OPTIONS, {"default": "16:9"}),
-                "分辨率": (VEO_NEW_RESOLUTION_OPTIONS, {"default": "720p"}),
-                "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
+                "模型": ("STRING", {"multiline": False, "default": "veo_3_1_i2v_fast_landscape"}),
+                "时长": (VEO_DURATION_OPTIONS, {"default": "6秒"}),
+                "参考图": ("IMAGE",),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
                 "最大轮询次数": ("INT", {"default": 300, "min": 1, "max": 3000}),
                 "轮询间隔秒": ("INT", {"default": 15, "min": 1, "max": 60}),
                 "绕过代理": ("BOOLEAN", {"default": True}),
             },
-            "optional": optional_images,
         }
 
     RETURN_TYPES = (IO.VIDEO, "STRING")
@@ -3432,11 +3478,9 @@ class KRVeoImageToVideoNode:
     def run(self, **kwargs):
         _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = (kwargs.get("提示词", "") or "").strip()
-        model = (kwargs.get("模型", "veo3.1-fast") or "").strip()
-        mode = (kwargs.get("模式", "文生视频") or "").strip()
-        aspect_ratio = (kwargs.get("比例", "16:9") or "").strip()
-        resolution = (kwargs.get("分辨率", "720p") or "").strip()
-        seed = int(kwargs.get("种子", 0))
+        model = (kwargs.get("模型", "veo_3_1_i2v_fast_landscape") or "").strip()
+        duration_seconds = _parse_veo_duration_seconds(str(kwargs.get("时长", "6秒")))
+        reference_image = kwargs.get("参考图")
         api_key = (kwargs.get("API密钥", "") or "").strip()
         max_poll = int(kwargs.get("最大轮询次数", 300))
         interval = int(kwargs.get("轮询间隔秒", 15))
@@ -3444,44 +3488,19 @@ class KRVeoImageToVideoNode:
         if not api_key:
             return (KRVideoAdapter(""), "API密钥为空")
 
-        # 收集参考图
-        ref_data_urls: List[str] = []
-        for i in range(1, 9):
-            img = kwargs.get(f"参考图{i}")
-            if not isinstance(img, torch.Tensor):
-                continue
-            ref_data_urls.append(_tensor_to_compressed_jpeg_data_url(img, max_long_side=1920, quality=100))
+        if not isinstance(reference_image, torch.Tensor):
+            return (KRVideoAdapter(""), "Veo图生视频需要提供参考图")
 
-        # 构造 payload
+        prompt_text = prompt or "生成视频"
+        image_url = _tensor_to_compressed_jpeg_data_url(reference_image, max_long_side=1920, quality=100)
         payload: Dict[str, Any] = {
             "model": model,
-            "prompt": prompt or "生成视频",
-            "aspectRatio": aspect_ratio,
+            "prompt": prompt_text,
+            "seconds": str(duration_seconds),
+            "messages": _build_veo_messages([image_url], prompt_text),
         }
 
-        if resolution:
-            payload["resolution"] = resolution
-
-        if seed > 0:
-            payload["seed"] = seed
-
-        if mode == "文生视频":
-            # 纯文本,不带图
-            pass
-        elif mode == "图生视频":
-            # 第一张参考图作为 firstFrame
-            if ref_data_urls:
-                payload["firstFrameBase64"] = ref_data_urls[0]
-            else:
-                return (KRVideoAdapter(""), "图生视频模式需要至少提供参考图1")
-        elif mode == "参考图生视频":
-            # 所有参考图作为 referenceImages（数组格式,最多3张）
-            if ref_data_urls:
-                payload["referenceImagesBase64"] = ref_data_urls[:3]
-            else:
-                return (KRVideoAdapter(""), "参考图生视频模式需要至少提供参考图1")
-
-        _log(f"Veo request: mode={mode}, model={model}, ratio={aspect_ratio}, res={resolution}, refs={len(ref_data_urls)}")
+        _log(f"Veo i2v request: model={model}, refs=1, seconds={duration_seconds}")
 
         video_url, error = _veo_submit_and_poll(api_key, model, payload, max_poll=max_poll, interval=float(interval))
 
@@ -3503,25 +3522,21 @@ class KRVeoImageToVideoNode:
 
 
 class KRVeoKeyframeVideoNode:
-    """Veo 首尾帧生成视频节点。"""
+    """Veo 首尾帧视频节点。"""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "提示词": ("STRING", {"multiline": True, "default": ""}),
-                "模型": (VEO_NEW_MODEL_PRESETS, {"default": "veo3.1-fast"}),
-                "比例": (VEO_NEW_ASPECT_RATIO_OPTIONS, {"default": "16:9"}),
-                "分辨率": (VEO_NEW_RESOLUTION_OPTIONS, {"default": "720p"}),
-                "种子": ("INT", {"default": 0, "min": 0, "max": 2147483647, "control_after_generate": True}),
+                "模型": ("STRING", {"multiline": False, "default": "veo_3_1_i2v_fast_landscape"}),
+                "时长": (VEO_DURATION_OPTIONS, {"default": "6秒"}),
+                "首帧图": ("IMAGE",),
+                "尾帧图": ("IMAGE",),
                 "API密钥": ("STRING", {"multiline": False, "default": ""}),
                 "最大轮询次数": ("INT", {"default": 300, "min": 1, "max": 3000}),
                 "轮询间隔秒": ("INT", {"default": 15, "min": 1, "max": 60}),
                 "绕过代理": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "首帧图": ("IMAGE",),
-                "尾帧图": ("IMAGE",),
             },
         }
 
@@ -3533,10 +3548,8 @@ class KRVeoKeyframeVideoNode:
     def run(self, **kwargs):
         _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
         prompt = (kwargs.get("提示词", "") or "").strip()
-        model = (kwargs.get("模型", "veo3.1-fast") or "").strip()
-        aspect_ratio = (kwargs.get("比例", "16:9") or "").strip()
-        resolution = (kwargs.get("分辨率", "720p") or "").strip()
-        seed = int(kwargs.get("种子", 0))
+        model = (kwargs.get("模型", "veo_3_1_i2v_fast_landscape") or "").strip()
+        duration_seconds = _parse_veo_duration_seconds(str(kwargs.get("时长", "6秒")))
         api_key = (kwargs.get("API密钥", "") or "").strip()
         max_poll = int(kwargs.get("最大轮询次数", 300))
         interval = int(kwargs.get("轮询间隔秒", 15))
@@ -3548,25 +3561,20 @@ class KRVeoKeyframeVideoNode:
 
         if not isinstance(first_frame, torch.Tensor):
             return (KRVideoAdapter(""), "首尾帧模式至少需要提供首帧图")
+        if not isinstance(last_frame, torch.Tensor):
+            return (KRVideoAdapter(""), "首尾帧模式需要提供尾帧图")
 
+        prompt_text = prompt or "动起来"
+        first_url = _tensor_to_compressed_jpeg_data_url(first_frame, max_long_side=1920, quality=100)
+        last_url = _tensor_to_compressed_jpeg_data_url(last_frame, max_long_side=1920, quality=100)
         payload: Dict[str, Any] = {
             "model": model,
-            "prompt": prompt or "动起来",
-            "aspectRatio": aspect_ratio,
+            "prompt": prompt_text,
+            "seconds": str(duration_seconds),
+            "messages": _build_veo_messages([first_url, last_url], prompt_text),
         }
 
-        if resolution:
-            payload["resolution"] = resolution
-
-        if seed > 0:
-            payload["seed"] = seed
-
-        payload["firstFrameBase64"] = _tensor_to_compressed_jpeg_data_url(first_frame, max_long_side=1920, quality=100)
-
-        if isinstance(last_frame, torch.Tensor):
-            payload["lastFrameBase64"] = _tensor_to_compressed_jpeg_data_url(last_frame, max_long_side=1920, quality=100)
-
-        _log(f"Veo keyframe request: model={model}, ratio={aspect_ratio}, res={resolution}, has_last={'yes' if isinstance(last_frame, torch.Tensor) else 'no'}")
+        _log(f"Veo keyframe request: model={model}, refs=2, seconds={duration_seconds}")
 
         video_url, error = _veo_submit_and_poll(api_key, model, payload, max_poll=max_poll, interval=float(interval))
 
@@ -3584,205 +3592,6 @@ class KRVeoKeyframeVideoNode:
             video_output = KRVideoAdapter(file_path)
 
         return (video_output, f"成功: {video_url}")
-
-
-class KRVeoI2VGenerateNode:
-    """Veo 图生视频节点（按 API-Reference 1.5）.
-
-    - 提交: POST https://ai.krapi.cn/v1/generate
-    - 轮询: GET  https://ai.krapi.cn/v1/tasks/{id}
-    - 下载: 优先 tasks/{id}/file，其次使用任务结果中的 url/video_url/file_url
-    """
-
-    DEFAULT_MODEL = "veo_3_1_i2v_fast_landscape"
-    API_BASE = "https://ai.krapi.cn"
-    ASPECT_RATIO_OPTIONS = [
-        "16:9",
-        "9:16",
-    ]
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "提示词": ("STRING", {"multiline": True, "default": ""}),
-                "模型": ("STRING", {"multiline": False, "default": cls.DEFAULT_MODEL}),
-                "比例": (cls.ASPECT_RATIO_OPTIONS, {"default": "16:9"}),
-                "API密钥": ("STRING", {"multiline": False, "default": ""}),
-                "最大轮询次数": ("INT", {"default": 180, "min": 1, "max": 3000}),
-                "轮询间隔秒": ("INT", {"default": 5, "min": 1, "max": 60}),
-                "绕过代理": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "参考图1": ("IMAGE",),
-                "参考图2": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = (IO.VIDEO, "STRING")
-    RETURN_NAMES = ("视频", "信息")
-    FUNCTION = "run"
-    CATEGORY = CATEGORY_NAME
-
-    def _apply_ratio_to_model(self, model_name: str, aspect_ratio: str) -> str:
-        model = (model_name or "").strip()
-        target = "portrait" if aspect_ratio == "9:16" else "landscape"
-
-        if "_landscape" in model:
-            return model.replace("_landscape", f"_{target}")
-        if "_portrait" in model:
-            return model.replace("_portrait", f"_{target}")
-
-        for suffix in ("_1080p", "_4k"):
-            if model.endswith(suffix):
-                return f"{model[:-len(suffix)]}_{target}{suffix}"
-
-        return f"{model}_{target}" if model else model
-
-    def _extract_task_id(self, payload: Any) -> str:
-        if not isinstance(payload, dict):
-            return ""
-        for key in ("task_id", "taskId", "id"):
-            val = payload.get(key)
-            if isinstance(val, (str, int)) and str(val).strip():
-                return str(val).strip()
-        data_obj = payload.get("data")
-        if isinstance(data_obj, dict):
-            for key in ("task_id", "taskId", "id"):
-                val = data_obj.get(key)
-                if isinstance(val, (str, int)) and str(val).strip():
-                    return str(val).strip()
-        return ""
-
-    def _extract_video_url(self, payload: Any) -> str:
-        if not isinstance(payload, dict):
-            return ""
-        for key in ("video_url", "url", "file_url"):
-            val = payload.get(key)
-            if isinstance(val, str) and val.startswith(("http://", "https://")):
-                return val
-        result = payload.get("result")
-        if isinstance(result, dict):
-            for key in ("video_url", "url", "file_url"):
-                val = result.get(key)
-                if isinstance(val, str) and val.startswith(("http://", "https://")):
-                    return val
-        data_obj = payload.get("data")
-        if isinstance(data_obj, dict):
-            for key in ("video_url", "url", "file_url"):
-                val = data_obj.get(key)
-                if isinstance(val, str) and val.startswith(("http://", "https://")):
-                    return val
-        return ""
-
-    def run(self, **kwargs):
-        _set_bypass_proxy(bool(kwargs.get("绕过代理", True)))
-        prompt = str(kwargs.get("提示词", "") or "").strip()
-        model_name = str(kwargs.get("模型", self.DEFAULT_MODEL) or self.DEFAULT_MODEL).strip()
-        aspect_ratio = str(kwargs.get("比例", "16:9") or "16:9").strip()
-        api_key = str(kwargs.get("API密钥", "") or "").strip()
-        max_polls = int(kwargs.get("最大轮询次数", 180))
-        interval_sec = int(kwargs.get("轮询间隔秒", 5))
-        image_1 = kwargs.get("参考图1")
-        image_2 = kwargs.get("参考图2")
-
-        if not api_key:
-            return (KRVideoAdapter(""), "API密钥为空")
-        if not isinstance(image_1, torch.Tensor):
-            return (KRVideoAdapter(""), "图生视频至少需要 参考图1")
-        if aspect_ratio not in {"16:9", "9:16"}:
-            aspect_ratio = "16:9"
-
-        effective_model = self._apply_ratio_to_model(model_name, aspect_ratio)
-
-        content_parts: List[Dict[str, Any]] = [
-            {"type": "image_url", "image_url": {"url": _tensor_to_compressed_jpeg_data_url(image_1, max_long_side=1920, quality=100)}}
-        ]
-        if isinstance(image_2, torch.Tensor):
-            content_parts.append({"type": "image_url", "image_url": {"url": _tensor_to_compressed_jpeg_data_url(image_2, max_long_side=1920, quality=100)}})
-        content_parts.append({"type": "text", "text": prompt or "Make a smooth cinematic motion."})
-
-        submit_payload: Dict[str, Any] = {
-            "model": effective_model,
-            "messages": [{"role": "user", "content": content_parts}],
-        }
-
-        submit_url = f"{self.API_BASE.rstrip('/')}/v1/generate"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-API-Key": api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-        _log(
-            f"Veo(generate) submit: model_input={model_name}, model_final={effective_model}, "
-            f"refs={2 if isinstance(image_2, torch.Tensor) else 1}, ratio={aspect_ratio}, url={submit_url}"
-        )
-
-        try:
-            submit_resp = _http_post(submit_url, headers=headers, json=submit_payload, timeout=(120, 600))
-        except Exception as exc:
-            return (KRVideoAdapter(""), f"提交异常: {exc}")
-
-        if submit_resp.status_code not in (200, 201, 202):
-            return (KRVideoAdapter(""), f"提交失败: HTTP {submit_resp.status_code} - {(submit_resp.text or '')[:400]}")
-
-        try:
-            submit_body = submit_resp.json()
-        except Exception:
-            return (KRVideoAdapter(""), f"提交失败: 非JSON响应 - {(submit_resp.text or '')[:300]}")
-
-        task_id = self._extract_task_id(submit_body)
-        if not task_id:
-            direct_url = self._extract_video_url(submit_body)
-            if direct_url:
-                file_path = _download_video_to_temp(direct_url, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
-                if file_path:
-                    return ((VideoFromFile(file_path) if VideoFromFile is not None else KRVideoAdapter(file_path)), f"成功: {direct_url}")
-            return (KRVideoAdapter(""), f"提交成功但无task_id: {json.dumps(submit_body, ensure_ascii=False)[:400]}")
-
-        query_url = f"{self.API_BASE.rstrip('/')}/v1/tasks/{task_id}"
-        last_payload: Dict[str, Any] = {}
-        for attempt in range(1, max_polls + 1):
-            time.sleep(interval_sec)
-            try:
-                poll_resp = _http_get(query_url, headers={"Authorization": f"Bearer {api_key}"}, timeout=(20, 120))
-            except Exception as exc:
-                _log(f"Veo(generate) poll exception: attempt={attempt}, error={exc}")
-                continue
-
-            if poll_resp.status_code != 200:
-                _log(f"Veo(generate) poll failed: attempt={attempt}, http={poll_resp.status_code}, body={(poll_resp.text or '')[:220]}")
-                continue
-
-            try:
-                body = poll_resp.json()
-            except Exception:
-                body = {"raw": (poll_resp.text or "")[:500]}
-
-            if isinstance(body, dict):
-                last_payload = body
-            status = str((body or {}).get("status", "")).strip().lower()
-            _log(f"Veo(generate) poll: attempt={attempt}, status={status or 'unknown'}")
-
-            if status in {"failed", "error", "canceled", "cancelled"}:
-                return (KRVideoAdapter(""), f"任务失败: {json.dumps(body, ensure_ascii=False)[:400]}")
-
-            if status in {"completed", "done", "success", "succeeded"}:
-                # 优先官方下载路由
-                file_endpoint = f"{self.API_BASE.rstrip('/')}/v1/tasks/{task_id}/file"
-                local_path = _download_video_to_temp(file_endpoint, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
-                if not local_path:
-                    video_url = self._extract_video_url(body)
-                    if video_url:
-                        local_path = _download_video_to_temp(video_url, timeout_sec=600, headers={"Authorization": f"Bearer {api_key}"})
-                if not local_path:
-                    return (KRVideoAdapter(""), f"任务完成但下载失败: {json.dumps(body, ensure_ascii=False)[:400]}")
-                video_output = VideoFromFile(local_path) if VideoFromFile is not None else KRVideoAdapter(local_path)
-                return (video_output, f"成功: task={task_id}")
-
-        return (KRVideoAdapter(""), f"轮询超时: task={task_id}, last={json.dumps(last_payload, ensure_ascii=False)[:400]}")
 
 
 # ================================
@@ -3906,6 +3715,44 @@ def _gpt_image2_resolve_size(aspect_ratio: str, resolution: str) -> str:
     return f"{int(w)}x{int(h)}"
 
 
+def _build_gpt_image2_edit_multipart(
+    prompt: str,
+    size: str,
+    aspect_ratio: str,
+    resolution: str,
+    quality: str,
+    output_format: str,
+    refs: List[torch.Tensor],
+) -> Tuple[Dict[str, str], List[Tuple[str, Tuple[str, bytes, str]]]]:
+    form_data: Dict[str, str] = {
+        "model": "gpt-image-2",
+        "prompt": prompt,
+        "n": "1",
+        "size": size,
+        "quality": quality,
+        "response_format": "url",
+    }
+    if output_format:
+        form_data["output_format"] = output_format
+
+    files: List[Tuple[str, Tuple[str, bytes, str]]] = []
+    for index, ref in enumerate(refs):
+        field = "image" if len(refs) == 1 else "image[]"
+        filename = f"image-{index + 1}.jpg"
+        files.append(
+            (
+                field,
+                (
+                    filename,
+                    _tensor_to_compressed_jpeg_bytes(ref, max_long_side=2048, quality=100),
+                    "image/jpeg",
+                ),
+            )
+        )
+
+    return form_data, files
+
+
 class KRGPTImage2Node:
     """GPT-Image-2 生图节点。
     走 /v1/images/generations(文生图）或 /v1/images/edits（图生图）。
@@ -3982,16 +3829,18 @@ class KRGPTImage2Node:
 
         # 判断走 generations 还是 edits
         if refs:
-            return self._run_edits(prompt, size, quality_value, output_format, seed, api_key, refs, max_wait)
+            return self._run_edits(prompt, size, aspect_ratio, resolution, quality_value, output_format, seed, api_key, refs, max_wait)
         else:
-            return self._run_generations(prompt, size, quality_value, output_format, seed, api_key, max_wait)
+            return self._run_generations(prompt, size, aspect_ratio, resolution, quality_value, output_format, seed, api_key, max_wait)
 
-    def _run_generations(self, prompt, size, quality, output_format, seed, api_key, max_wait=600):
+    def _run_generations(self, prompt, size, aspect_ratio, resolution, quality, output_format, seed, api_key, max_wait=600):
         """文生图：POST /v1/images/generations"""
         payload: Dict[str, Any] = {
             "model": "gpt-image-2",
             "prompt": prompt,
             "size": size,
+            "ratio": aspect_ratio,
+            "image_size": resolution,
             "n": 1,
             "quality": quality,
             "output_format": output_format,
@@ -4008,47 +3857,66 @@ class KRGPTImage2Node:
         )
         return result
 
-    def _run_edits(self, prompt, size, quality, output_format, seed, api_key, refs, max_wait=600):
-        """图生图：POST /v1/images/edits（JSON 格式，用 image_url base64）"""
-        # 把参考图编码成 data URL
-        image_urls: List[Dict[str, str]] = []
-        for ref in refs:
-            data_url = _tensor_to_compressed_jpeg_data_url(ref, max_long_side=2048, quality=100)
-            image_urls.append({"image_url": data_url})
-
-        payload: Dict[str, Any] = {
-            "model": "gpt-image-2",
-            "prompt": prompt,
-            "size": size,
-            "n": 1,
-            "quality": quality,
-            "output_format": output_format,
-            "images": image_urls,
-        }
+    def _run_edits(self, prompt, size, aspect_ratio, resolution, quality, output_format, seed, api_key, refs, max_wait=600):
+        """图生图：POST /v1/images/edits（官方 multipart/form-data）。"""
+        form_data, files = _build_gpt_image2_edit_multipart(prompt, size, aspect_ratio, resolution, quality, output_format, refs)
 
         _log(f"GPT-Image-2 edits: size={size}, quality={quality}, format={output_format}, refs={len(refs)}")
 
         # 走原生异步图片任务
-        result = self._submit_and_poll(
+        result = self._submit_multipart_and_poll(
             path="/v1/images/edits",
-            payload=payload,
+            form_data=form_data,
+            files=files,
             api_key=api_key,
             max_wait=max_wait,
         )
         return result
 
-    def _submit_and_poll(self, path: str, payload: Dict[str, Any], api_key: str, max_wait: int = 600):
-        """提交到原生图片异步通道,轮询拿结果。"""
+    def _submit_multipart_and_poll(
+        self,
+        path: str,
+        form_data: Dict[str, str],
+        files: List[Tuple[str, Tuple[str, bytes, str]]],
+        api_key: str,
+        max_wait: int = 600,
+    ):
+        """提交 multipart 官方图片任务,轮询拿结果。"""
         submit_url = OPENAI_API_ROOT.rstrip("/") + path
 
-        headers = _make_headers(api_key)
-
         try:
-            resp = _http_post(submit_url, headers=headers, json=payload, timeout=(120, 600))
+            resp = _http_post(
+                submit_url,
+                headers=_make_multipart_headers(api_key),
+                data=form_data,
+                files=files,
+                timeout=(120, 600),
+            )
         except Exception as exc:
             _log(f"GPT-Image-2 submit exception: {exc}")
             return (_blank_image(1024),)
 
+        return self._handle_submit_response(resp, api_key, max_wait)
+
+    def _submit_and_poll(
+        self,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        api_key: str,
+        max_wait: int = 600,
+    ):
+        """提交到原生图片异步通道,轮询拿结果。"""
+        submit_url = OPENAI_API_ROOT.rstrip("/") + path
+
+        try:
+            resp = _http_post(submit_url, headers=_make_headers(api_key), json=payload or {}, timeout=(120, 600))
+        except Exception as exc:
+            _log(f"GPT-Image-2 submit exception: {exc}")
+            return (_blank_image(1024),)
+
+        return self._handle_submit_response(resp, api_key, max_wait)
+
+    def _handle_submit_response(self, resp: requests.Response, api_key: str, max_wait: int = 600):
         _log(f"GPT-Image-2 submit result: http={resp.status_code}, body={resp.text[:500]}")
 
         if resp.status_code not in (200, 201, 202):
@@ -4118,7 +3986,6 @@ NODE_CLASS_MAPPINGS = {
     "KRGPTImage2Node": KRGPTImage2Node,
     "KRVeoImageToVideoNode": KRVeoImageToVideoNode,
     "KRVeoKeyframeVideoNode": KRVeoKeyframeVideoNode,
-    "KRVeoI2VGenerateNode": KRVeoI2VGenerateNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -4132,5 +3999,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KRGPTImage2Node": "KR-GPT-Image-2\u751f\u56fe",
     "KRVeoImageToVideoNode": "KR-Veo图生视频",
     "KRVeoKeyframeVideoNode": "KR-Veo首尾帧视频",
-    "KRVeoI2VGenerateNode": "KR-Veo图生视频(Generate)",
 }
